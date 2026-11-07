@@ -1,0 +1,64 @@
+# Jaipur -> Kochi fare monitor: non-secret settings.
+# Secrets (API keys, bot tokens, SMTP passwords) are NEVER stored here; they come from
+# environment variables / GitHub Actions secrets. Most keys below can also be overridden
+# with an environment variable (listed next to the key).
+
+[trip]
+origin = "JAI"                      # Jaipur International Airport
+destination = "COK"                 # Cochin International Airport
+dates = ["2027-01-04", "2027-01-05"]
+adults = 1
+cabin = "economy"
+currency = "INR"
+timezone = "Asia/Kolkata"
+
+[preferences]
+# Hard filters. Options outside these limits are not recorded.
+max_stops = 2                       # PREF_MAX_STOPS
+max_duration_hours = 18             # PREF_MAX_DURATION_HOURS
+earliest_departure = "00:00"        # local time at JAI
+latest_departure = "23:59"
+min_layover_minutes = 45            # shorter connections are too risky
+max_layover_minutes = 600
+# "Best value" ranking = fare + value_inr_per_hour * journey hours + value_inr_per_stop * stops.
+# Used only to highlight a recommendation next to the cheapest fare. Alerts are always on price.
+value_inr_per_hour = 300
+value_inr_per_stop = 750
+store_top_n = 20                    # options stored per (provider, date, run)
+
+[verification]
+# Minimum verification level a fare needs before it can set a record low or trigger an alert:
+#   verified       re-priced, live bookable offer from a booking API (Duffel)
+#   seller_quoted  final price quoted by a named seller (airline / OTA) via Google Flights booking options
+#   indicative     search-result price only; never alerts unless you lower this setting
+alert_min_status = "seller_quoted"  # ALERT_MIN_STATUS
+stale_after_minutes = 120           # older observations are shown as stale, never as "current"
+min_plausible_fare = 1000           # sanity bounds: anything outside is rejected as a data error
+max_plausible_fare = 150000
+
+[alerts]
+min_drop_inr = 200                  # a record low must beat the previous low by at least this...
+min_drop_pct = 2.0                  # ...and by at least this percentage, to be "meaningful"
+target_fare_inr = 0                 # TARGET_FARE_INR: alert at or below this fare (0 = disabled)
+attractive_below_median_pct = 15.0  # alert if fare is this % below the 7-day median of hourly lows
+attractive_min_history = 24         # ...once at least this many hourly lows exist for the date
+competitive_pct = 5.0               # new/returning flight alerts if within this % of the current low
+reappear_after_hours = 6            # a flight unseen for this long counts as "previously unavailable"
+send_baseline = true                # send one message with the first verified low per date
+daily_summary_hour = 8              # local hour (IST) after which the daily summary is sent
+health_alert_after_failures = 3     # consecutive fully-failed runs before an operations alert
+
+[providers]
+enabled = ["duffel", "serpapi_google_flights"]   # PROVIDERS (comma separated)
+
+[providers.duffel]
+max_connections = 2
+supplier_timeout_ms = 20000
+verify_top_n = 3                    # cheapest offers per date re-priced with GET /air/offers/{id}
+
+[providers.serpapi_google_flights]
+deep_search = true                  # matches results shown in a browser more closely (slower)
+booking_checks_per_date = 2         # cheapest itineraries per date checked for seller quotes
+
+[notify]
+channels = ["telegram"]             # NOTIFY_CHANNELS: telegram, email, console (comma separated)

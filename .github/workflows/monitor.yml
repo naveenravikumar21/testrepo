@@ -1,0 +1,130 @@
+name: Fare monitor (JAI → COK)
+
+on:
+  schedule:
+    - cron: "17 * * * *"          # hourly, at :17 to avoid the top-of-hour scheduler backlog
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "What to do"
+        type: choice
+        options: [run, test-notify, send-summary]
+        default: run
+      dry_run:
+        description: "Dry run: print notifications to the log only and do NOT save state"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write                 # push the state snapshot to the fare-data branch
+  actions: write                  # disable this workflow once the travel dates have passed
+
+concurrency:
+  group: fare-monitor
+  cancel-in-progress: false       # never run two cycles against the same database at once
+
+env:
+  STATE_BRANCH: fare-data
+  FARE_STATE_DIR: state
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  monitor:
+    # Manual stop: set the repository variable MONITOR_ENABLED=false (or disable this workflow).
+    if: vars.MONITOR_ENABLED != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore state (SQLite database) from the fare-data branch
+        id: restore
+        run: |
+          set -euo pipefail
+          mkdir -p state
+          rc=0
+          git ls-remote --exit-code --heads origin "$STATE_BRANCH" > /dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            git fetch --depth 1 origin "$STATE_BRANCH"
+            git archive FETCH_HEAD | tar -x -C state
+            test -s state/fares.sqlite3 || { echo "::error::State branch exists but has no database"; exit 1; }
+            echo "Restored state from $STATE_BRANCH"
+          elif [ "$rc" -eq 2 ]; then
+            echo "No state branch yet: starting a fresh database"
+          else
+            echo "::error::Could not query the state branch (git exit $rc); refusing to run without history"
+            exit 1
+          fi
+
+      - name: Run monitoring cycle
+        id: run
+        env:
+          DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_ACCESS_TOKEN }}
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_USE_SSL: ${{ vars.SMTP_USE_SSL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          NOTIFY_CHANNELS: ${{ vars.NOTIFY_CHANNELS }}
+          PROVIDERS: ${{ vars.PROVIDERS }}
+          ALERT_MIN_STATUS: ${{ vars.ALERT_MIN_STATUS }}
+          TARGET_FARE_INR: ${{ vars.TARGET_FARE_INR }}
+          DAILY_SUMMARY_HOUR: ${{ vars.DAILY_SUMMARY_HOUR }}
+          DASHBOARD_URL: ${{ vars.DASHBOARD_URL }}
+          MONITOR_ENABLED: ${{ vars.MONITOR_ENABLED }}
+          COMMAND: ${{ inputs.command || 'run' }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          case "$COMMAND" in
+            test-notify)  python -m fare_monitor test-notify ;;
+            send-summary) python -m fare_monitor summary --send ;;
+            *)            if [ "$DRY_RUN" = "true" ]; then python -m fare_monitor run --dry-run
+                          else python -m fare_monitor run; fi ;;
+          esac
+
+      - name: Save state snapshot to the fare-data branch
+        # Runs even when the cycle failed, so failure counters and partial results are kept.
+        if: always() && steps.restore.outcome == 'success' && !inputs.dry_run && inputs.command != 'test-notify'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -s state/fares.sqlite3 || { echo "No database produced; nothing to save"; exit 0; }
+          cd state
+          git init -q -b "$STATE_BRANCH"
+          git config user.name "fare-monitor[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Fare monitor state $(date -u +%Y-%m-%dT%H:%MZ) (run ${GITHUB_RUN_ID})"
+          # A single-commit snapshot is force-pushed: the full price history lives inside the database,
+          # so the repository does not grow by one database copy per hour.
+          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${STATE_BRANCH}"
+
+      - name: Back up database as a workflow artifact
+        if: always() && steps.restore.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fare-state-${{ github.run_id }}
+          path: state/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Stop monitoring after the travel dates have passed
+        if: steps.run.outputs.window_closed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable monitor.yml --repo "$GITHUB_REPOSITORY"

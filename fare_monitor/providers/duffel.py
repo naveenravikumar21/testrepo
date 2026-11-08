@@ -72,7 +72,7 @@ class DuffelProvider(Provider):
             raise ProviderError(f"Duffel {what}: HTTP {resp.status_code} {msg}")
         return payload
 
-    def search(self, origin: str, destination: str, travel_date: date, max_stops: int = 2):
+    def search(self, origin: str, destination: str, travel_date: date, max_stops: int = 2, airlines=()):
         d = self.config.defaults
         body = {
             "data": {

@@ -78,3 +78,17 @@ body:
         - Up to 1 stop
         - Non-stop only
       default: 0
+  - type: dropdown
+    id: airlines
+    attributes:
+      label: Airlines
+      description: Only watch these airlines (every flight of the trip must be on one of them). Leave as "Any airline" to compare all.
+      multiple: true
+      options:
+        - Any airline
+        - IndiGo
+        - Akasa Air
+        - Air India
+        - Air India Express
+        - SpiceJet
+      default: 0

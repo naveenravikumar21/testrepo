@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE TABLE IF NOT EXISTS watches (
     id TEXT PRIMARY KEY,
     title TEXT, url TEXT, origin TEXT, destination TEXT, dates_json TEXT, days_json TEXT,
-    frequency TEXT, target REAL, max_stops INTEGER, active INTEGER NOT NULL DEFAULT 1,
+    frequency TEXT, target REAL, max_stops INTEGER, airlines_json TEXT, active INTEGER NOT NULL DEFAULT 1,
     body_hash TEXT, created_at TEXT, updated_at TEXT, last_checked TEXT, status_comment_id INTEGER
 );
 CREATE TABLE IF NOT EXISTS api_usage (
@@ -104,6 +104,15 @@ CREATE TABLE IF NOT EXISTS api_usage (
 );
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
 """
+
+
+def carrier_clause(carriers) -> tuple[str, list]:
+    """SQL that keeps only itineraries where EVERY leg is flown by one of `carriers` (IATA codes)."""
+    if not carriers:
+        return "", []
+    q = ",".join("?" * len(carriers))
+    return (f" AND NOT EXISTS (SELECT 1 FROM json_each(flight_numbers) "
+            f"WHERE substr(json_each.value, 1, instr(json_each.value, ' ') - 1) NOT IN ({q}))", list(carriers))
 
 
 def utcnow() -> datetime:
@@ -123,7 +132,13 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self):
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(watches)")}
+        if "airlines_json" not in cols:
+            self.conn.execute("ALTER TABLE watches ADD COLUMN airlines_json TEXT")
 
     def close(self):
         self.conn.commit()
@@ -175,17 +190,19 @@ class Database:
              opt.observed_at))
         return cur.lastrowid
 
-    def previous_low(self, origin, destination, travel_date, min_ver, max_stops, before_run_id):
+    def previous_low(self, origin, destination, travel_date, min_ver, max_stops, before_run_id, carriers=None):
+        cc, ca = carrier_clause(carriers)
         return self.conn.execute(
-            """SELECT * FROM observations WHERE origin=? AND destination=? AND travel_date=? AND verification>=?
-               AND stops<=? AND run_id<? ORDER BY price ASC, observed_at ASC LIMIT 1""",
-            (origin, destination, travel_date, min_ver, max_stops, before_run_id)).fetchone()
+            f"""SELECT * FROM observations WHERE origin=? AND destination=? AND travel_date=? AND verification>=?
+               AND stops<=? AND run_id<?{cc} ORDER BY price ASC, observed_at ASC LIMIT 1""",
+            (origin, destination, travel_date, min_ver, max_stops, before_run_id, *ca)).fetchone()
 
-    def run_observations(self, run_id, origin, destination, travel_date, min_ver=1, max_stops=9):
+    def run_observations(self, run_id, origin, destination, travel_date, min_ver=1, max_stops=9, carriers=None):
+        cc, ca = carrier_clause(carriers)
         return self.conn.execute(
-            """SELECT * FROM observations WHERE run_id=? AND origin=? AND destination=? AND travel_date=?
-               AND verification>=? AND stops<=? ORDER BY price ASC, verification DESC, duration_minutes ASC""",
-            (run_id, origin, destination, travel_date, min_ver, max_stops)).fetchall()
+            f"""SELECT * FROM observations WHERE run_id=? AND origin=? AND destination=? AND travel_date=?
+               AND verification>=? AND stops<=?{cc} ORDER BY price ASC, verification DESC, duration_minutes ASC""",
+            (run_id, origin, destination, travel_date, min_ver, max_stops, *ca)).fetchall()
 
     def recent_confirmation(self, flight_key: str, min_ver: int, since: datetime):
         return self.conn.execute(
@@ -203,14 +220,15 @@ class Database:
             "SELECT 1 FROM searches WHERE origin=? AND destination=? AND travel_date=? AND status IN ('ok','empty')"
             " AND run_id<? LIMIT 1", (origin, destination, travel_date, before_run_id)).fetchone() is not None
 
-    def lows_per_run(self, origin, destination, travel_date, min_ver=1, max_stops=9):
+    def lows_per_run(self, origin, destination, travel_date, min_ver=1, max_stops=9, carriers=None):
         """Lowest fare per check for a route/date: the historical trend."""
+        cc, ca = carrier_clause(carriers)
         return self.conn.execute(
-            """SELECT r.id AS run_id, r.started_at, MIN(o.price) AS price, MAX(o.verification) AS verification
+            f"""SELECT r.id AS run_id, r.started_at, MIN(o.price) AS price, MAX(o.verification) AS verification
                FROM observations o JOIN runs r ON r.id=o.run_id
-               WHERE o.origin=? AND o.destination=? AND o.travel_date=? AND o.verification>=? AND o.stops<=?
+               WHERE o.origin=? AND o.destination=? AND o.travel_date=? AND o.verification>=? AND o.stops<=?{cc}
                GROUP BY r.id ORDER BY r.started_at""",
-            (origin, destination, travel_date, min_ver, max_stops)).fetchall()
+            (origin, destination, travel_date, min_ver, max_stops, *ca)).fetchall()
 
     def add_record_low(self, origin, destination, travel_date, observation_id, price, previous_low, now):
         self.conn.execute(
@@ -219,11 +237,12 @@ class Database:
             (origin, destination, travel_date, observation_id, price, previous_low, iso(now)))
         self.conn.commit()
 
-    def all_time_low(self, origin, destination, travel_date, min_ver, max_stops=9):
+    def all_time_low(self, origin, destination, travel_date, min_ver, max_stops=9, carriers=None):
+        cc, ca = carrier_clause(carriers)
         return self.conn.execute(
-            """SELECT * FROM observations WHERE origin=? AND destination=? AND travel_date=? AND verification>=?
-               AND stops<=? ORDER BY price ASC, observed_at ASC LIMIT 1""",
-            (origin, destination, travel_date, min_ver, max_stops)).fetchone()
+            f"""SELECT * FROM observations WHERE origin=? AND destination=? AND travel_date=? AND verification>=?
+               AND stops<=?{cc} ORDER BY price ASC, observed_at ASC LIMIT 1""",
+            (origin, destination, travel_date, min_ver, max_stops, *ca)).fetchone()
 
     def latest_route_search(self, origin, destination, travel_date):
         """Most recent successful search for a route/date and its observations."""
@@ -271,16 +290,17 @@ class Database:
     def upsert_watch(self, w, now: datetime):
         existing = self.get_watch(w.id)
         vals = (w.title, w.url, w.origin, w.destination, json.dumps([d.isoformat() for d in w.dates]),
-                json.dumps(w.days), w.frequency, w.target, w.max_stops, w.body_hash, iso(now))
+                json.dumps(w.days), w.frequency, w.target, w.max_stops, json.dumps(w.airlines), w.body_hash, iso(now))
         if existing:
             self.conn.execute(
                 """UPDATE watches SET title=?, url=?, origin=?, destination=?, dates_json=?, days_json=?, frequency=?,
-                   target=?, max_stops=?, body_hash=?, updated_at=?, active=1 WHERE id=?""", (*vals, w.id))
+                   target=?, max_stops=?, airlines_json=?, body_hash=?, updated_at=?, active=1 WHERE id=?""",
+                (*vals, w.id))
         else:
             self.conn.execute(
                 """INSERT INTO watches(title, url, origin, destination, dates_json, days_json, frequency, target,
-                   max_stops, body_hash, updated_at, created_at, id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (*vals, iso(now), w.id))
+                   max_stops, airlines_json, body_hash, updated_at, created_at, id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (*vals, iso(now), w.id))
         self.conn.commit()
 
     def set_watch_field(self, watch_id: str, field: str, value):

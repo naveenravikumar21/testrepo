@@ -41,8 +41,10 @@ class Provider(ABC):
         return False
 
     @abstractmethod
-    def search(self, origin: str, destination: str, travel_date: date, max_stops: int) -> tuple[list[FareOption], dict]:
-        """Return (options, metadata). Raise ProviderError on failure."""
+    def search(self, origin: str, destination: str, travel_date: date, max_stops: int,
+               airlines: tuple[str, ...] = ()) -> tuple[list[FareOption], dict]:
+        """Return (options, metadata). Raise ProviderError on failure. `airlines` (IATA codes) is a hint;
+        the runner always re-filters results so every leg is on one of those airlines."""
 
     def verify(self, option: FareOption) -> FareOption | None:
         """Re-check an option's final price. Return the updated option, or None if no longer available."""

@@ -23,12 +23,15 @@ def watch_infos(db, config: Config, watch, run_id: int | None, errored: set | No
     for d in dates or watch.dates:
         ds = d.isoformat()
         search, rows = db.latest_route_search(watch.origin, watch.destination, ds)
-        views = [row_view(r) for r in rows if r["stops"] <= watch.max_stops]
+        views = [row_view(r) for r in rows if r["stops"] <= watch.max_stops
+                 and (not watch.airlines or all(fn.split(" ")[0] in watch.airlines
+                                                for fn in json.loads(r["flight_numbers"])))]
         confirmed = None
         if run_id is not None:
-            c = db.run_observations(run_id, watch.origin, watch.destination, ds, min_ver, watch.max_stops)
+            c = db.run_observations(run_id, watch.origin, watch.destination, ds, min_ver, watch.max_stops,
+                                    watch.airlines)
             confirmed = row_view(c[0]) if c else None
-        low = db.all_time_low(watch.origin, watch.destination, ds, min_ver, watch.max_stops)
+        low = db.all_time_low(watch.origin, watch.destination, ds, min_ver, watch.max_stops, watch.airlines)
         meta = json.loads(search["meta_json"]) if search and search["meta_json"] else {}
         out.append({
             "date": ds,
@@ -42,7 +45,8 @@ def watch_infos(db, config: Config, watch, run_id: int | None, errored: set | No
             "price_insights": meta.get("price_insights"),
             "error": d in (errored or set()),
             "trend": [{"t": r["started_at"], "price": r["price"], "v": r["verification"]}
-                      for r in db.lows_per_run(watch.origin, watch.destination, ds, 1, watch.max_stops)],
+                      for r in db.lows_per_run(watch.origin, watch.destination, ds, 1, watch.max_stops,
+                                               watch.airlines)],
         })
     return out
 
@@ -174,7 +178,7 @@ def _watch_section(entry: dict, config: Config, idx: int) -> str:
     state = "active" if entry["active"] else "closed"
     head = (f"<h2>{_e(w.route)} <span class='muted'>· watch #{_e(w.id)} ({state})</span></h2>"
             f"<p class='muted'>{_e(', '.join(date.fromisoformat(i['date']).strftime('%d %b') for i in infos))} · "
-            f"checks {_e(w.days_label if len(w.days) == 7 else w.frequency.lower() + ' (' + w.days_label + ')')} · book-now price "
+            f"airlines: {_e(w.airlines_label)} · checks {_e(w.days_label if len(w.days) == 7 else w.frequency.lower() + ' (' + w.days_label + ')')} · book-now price "
             f"<b>{_e(fmt_inr(w.target) if w.target else 'not set')}</b> · last checked "
             f"{_e(entry['last_checked'] or 'never')}"
             + (f" · <a href='{_e(w.url)}' target='_blank' rel='noopener'>open watch</a>" if w.url else "") + "</p>")

@@ -108,8 +108,11 @@ class SerpApiGoogleFlightsProvider(Provider):
             raise ProviderError(f"SerpApi {what}: search status {status}")
         return payload
 
-    def search(self, origin: str, destination: str, travel_date: date, max_stops: int = 2):
-        payload = self._get(self._base_params(origin, destination, travel_date, max_stops), "search")
+    def search(self, origin: str, destination: str, travel_date: date, max_stops: int = 2, airlines=()):
+        params = self._base_params(origin, destination, travel_date, max_stops)
+        if airlines:
+            params["include_airlines"] = ",".join(airlines)
+        payload = self._get(params, "search")
         meta = {"price_insights": payload.get("price_insights"),
                 "google_flights_url": (payload.get("search_metadata") or {}).get("google_flights_url")}
         if payload.get("_no_results"):

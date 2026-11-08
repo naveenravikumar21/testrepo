@@ -67,3 +67,17 @@ def test_only_trusted_authors(config):
     assert not is_watch_issue(issue("x", title="Bug report"), config)
     assert is_trusted_author(issue("x"), config)
     assert not is_trusted_author(issue("x", assoc="NONE"), config)
+
+
+def test_airlines_field(config):
+    from fare_monitor.watches import parse_airlines
+    assert parse_airlines("IndiGo, Akasa Air") == (["6E", "QP"], [])
+    assert parse_airlines("Any airline") == ([], [])
+    assert parse_airlines("6E") == (["6E"], [])
+    assert parse_airlines("Air India Express") == (["IX"], [])
+    assert "Unknown airline" in parse_airlines("Pan Am")[1][0]
+    body = form_body() + "\n### Airlines\n\nIndiGo\n"
+    w = watch_from_issue(issue(body), config, TODAY)
+    assert w.airlines == ["6E"] and "IndiGo only" in w.summary_lines()[-1]
+    # "To" must not be confused with "How often to check" or "Stops"
+    assert (w.origin, w.destination, w.max_stops) == ("JAI", "COK", 2)

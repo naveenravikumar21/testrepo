@@ -21,6 +21,7 @@ SerpApi, inside SerpApi's free plan of 250 searches a month.
      the exact days.
    - Book-now price.
    - Stops.
+   - Airlines: for example IndiGo only, or any airline.
 3. Press **Submit**. Within a few minutes you'll see two comments, and get emails for them:
    - **Watch set up**: what will be checked and how many searches it will use. This comment becomes the
      **Latest status** and is edited quietly after every check.
@@ -46,8 +47,18 @@ Each alert includes:
 - who quoted the price, and when it was checked
 - a booking link
 
-**Change a watch:** edit the issue description; it's checked again straight away. **Stop it:** close the
-issue. You can have several watches at once.
+### Change, stop or add watches
+* **Change a watch** (dates, price, airlines, frequency):
+  1. Open the issue and click **⋯** at the top-right of the first post, then **Edit**.
+  2. Change the text under the heading you want, e.g. under `### Travel dates` write
+     `2027-01-04, 2027-01-05, 2027-01-06`.
+  3. Click **Update comment**.
+
+  The watch is re-checked within a few minutes. Ticking a day checkbox directly on the issue page also
+  saves straight away. Don't change the `### …` headings themselves.
+* **Stop a watch:** close the issue (**Close issue** at the bottom of the page).
+* **A different trip:** create a new issue with **Issues → New issue → Fare watch**. Use one issue per trip.
+* Ignore *Create sub-issue*, *Add artifact* and the pencil next to the title; the title isn't used.
 
 ### Emails
 GitHub sends these to your account's notification email (**github.com → Settings → Notifications →

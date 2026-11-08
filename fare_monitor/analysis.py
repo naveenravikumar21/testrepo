@@ -128,11 +128,13 @@ def decide_watch_alerts(db, run_id: int, watch, dates: list[date], config: Confi
 
     for d in dates:
         ds = d.isoformat()
-        rows = db.run_observations(run_id, watch.origin, watch.destination, ds, min_ver, watch.max_stops)
+        rows = db.run_observations(run_id, watch.origin, watch.destination, ds, min_ver, watch.max_stops,
+                                   watch.airlines)
         if not rows:
             continue
         best = row_view(rows[0])
-        prev_row = db.previous_low(watch.origin, watch.destination, ds, min_ver, watch.max_stops, run_id)
+        prev_row = db.previous_low(watch.origin, watch.destination, ds, min_ver, watch.max_stops, run_id,
+                                   watch.airlines)
         prev_low = prev_row["price"] if prev_row else None
         price_key = f"{watch.id}|{best['flight_key']}|{best['price']:.0f}"
 

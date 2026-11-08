@@ -26,6 +26,14 @@ CITY_CODES = {
     "lucknow": "LKO", "udaipur": "UDR", "jodhpur": "JDH", "indore": "IDR", "coimbatore": "CJB",
 }
 
+# Airline names -> IATA codes (2-character codes like 6E also work).
+AIRLINE_CODES = {
+    "indigo": "6E", "air india express": "IX", "air india": "AI", "akasa": "QP", "akasa air": "QP",
+    "spicejet": "SG", "vistara": "UK", "alliance air": "9I", "star air": "S5", "fly91": "IC",
+}
+AIRLINE_NAMES = {"6E": "IndiGo", "IX": "Air India Express", "AI": "Air India", "QP": "Akasa Air", "SG": "SpiceJet",
+                 "UK": "Vistara", "9I": "Alliance Air", "S5": "Star Air", "IC": "Fly91"}
+
 NO_RESPONSE = {"", "_no response_", "none", "n/a", "-"}
 MAX_STOPS_CHOICES = {"non-stop": 0, "nonstop": 0, "direct": 0, "up to 1": 1, "1 stop": 1, "any": 2, "up to 2": 2}
 
@@ -41,6 +49,7 @@ class Watch:
     frequency: str                   # human label
     target: float | None             # book-now price in INR
     max_stops: int
+    airlines: list[str] = field(default_factory=list)   # IATA codes; empty = any airline
     url: str = ""
     issue_number: int | None = None
     body_hash: str = ""
@@ -49,6 +58,10 @@ class Watch:
     @property
     def route(self) -> str:
         return f"{self.origin} → {self.destination}"
+
+    @property
+    def airlines_label(self) -> str:
+        return " / ".join(AIRLINE_NAMES.get(c, c) for c in self.airlines) + " only" if self.airlines else "any"
 
     @property
     def days_label(self) -> str:
@@ -81,6 +94,7 @@ class Watch:
             "at about 7 AM IST",
             f"Book-now price: {'₹{:,.0f}'.format(self.target) if self.target else 'not set'}",
             f"Stops: {['non-stop only', 'up to 1 stop', 'up to 2 stops'][self.max_stops]}",
+            f"Airlines: {self.airlines_label}",
         ]
 
 
@@ -104,9 +118,17 @@ def _sections(body: str) -> dict[str, str]:
 
 
 def _field(sections: dict[str, str], *keywords: str) -> str:
-    for label, value in sections.items():
-        if any(k in label for k in keywords):
-            return "" if value.strip().lower() in NO_RESPONSE else value.strip()
+    """Value of the first section whose label equals, or else starts a word with, one of the keywords."""
+    def clean(value):
+        return "" if value.strip().lower() in NO_RESPONSE else value.strip()
+    for k in keywords:
+        for label, value in sections.items():
+            if label == k:
+                return clean(value)
+    for k in keywords:
+        for label, value in sections.items():
+            if label.startswith(k):
+                return clean(value)
     return ""
 
 
@@ -205,6 +227,29 @@ def parse_price(value: str) -> float | None:
     return price if price > 0 else None
 
 
+def parse_airlines(value: str) -> tuple[list[str], list[str]]:
+    """'IndiGo, Akasa Air' / '6E' / 'Any' -> (["6E", "QP"], errors)."""
+    v = (value or "").strip()
+    if not v or v.lower().startswith("any"):
+        return [], []
+    codes, errors = [], []
+    for part in re.split(r"[,;/\n]|\band\b", v):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if name in AIRLINE_CODES:
+            code = AIRLINE_CODES[name]
+        elif re.fullmatch(r"[a-z0-9]{2}", name):
+            code = name.upper()
+        else:
+            code = next((c for n, c in sorted(AIRLINE_CODES.items(), key=lambda x: -len(x[0])) if n in name), None)
+        if code is None:
+            errors.append(f"Unknown airline '{part.strip()}'. Use a name like IndiGo or a 2-letter code like 6E.")
+        elif code not in codes:
+            codes.append(code)
+    return codes, errors
+
+
 def parse_stops(value: str, default: int) -> int:
     v = (value or "").lower()
     for key, n in MAX_STOPS_CHOICES.items():
@@ -237,6 +282,8 @@ def watch_from_issue(issue: dict, config, today: date) -> Watch:
     if ticked:
         days = ticked
         frequency = f"{len(ticked)} time{'s' if len(ticked) > 1 else ''} a week" if len(ticked) < 7 else "Every day"
+    airlines, airline_errors = parse_airlines(_field(s, "airline"))
+    errors += airline_errors
     target = parse_price(_field(s, "book-now", "price", "target"))
     if target is None and config.defaults.target_fare_inr:
         target = config.defaults.target_fare_inr
@@ -250,6 +297,7 @@ def watch_from_issue(issue: dict, config, today: date) -> Watch:
         frequency=frequency,
         target=target,
         max_stops=min(parse_stops(_field(s, "stops"), config.defaults.max_stops), config.defaults.max_stops),
+        airlines=airlines,
         url=issue.get("html_url", ""),
         issue_number=int(issue["number"]),
         body_hash=hashlib.sha256(body.encode()).hexdigest()[:16],
@@ -290,5 +338,6 @@ def watch_from_row(row) -> Watch:
                  dates=[date.fromisoformat(x) for x in json.loads(row["dates_json"] or "[]")],
                  days=json.loads(row["days_json"] or "[]"), frequency=row["frequency"] or "",
                  target=row["target"], max_stops=row["max_stops"] if row["max_stops"] is not None else 2,
+                 airlines=json.loads(row["airlines_json"] or "[]") if "airlines_json" in row.keys() else [],
                  url=row["url"] or "", issue_number=int(row["id"]) if str(row["id"]).isdigit() else None,
                  body_hash=row["body_hash"] or "")

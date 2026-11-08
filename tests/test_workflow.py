@@ -146,3 +146,17 @@ def test_dashboard_and_cli(config, monkeypatch, capsys):
     assert cli.main(["run", "--dry-run"]) == 2                    # no fare source -> configuration error
     assert cli.main(["check-config"]) == 0
     assert "test-key" not in capsys.readouterr().out
+
+
+def test_indigo_only_watch(config):
+    env = Env(config)
+    # Air India is cheaper on Jan 5 in this synthetic market, but the watch is IndiGo-only.
+    env.market.serp[D5].insert(0, via_bom_ai(D5, 6000, 6100))
+    env.gh.add_issue(9, form_body(dates="2027-01-05", target="8000") + "\n### Airlines\n\nIndiGo\n")
+    env.run("2026-11-08T10:00", force_ids={"9"})
+    searches = [c for c in env.session.calls if "serpapi.com/search" in c[1] and "booking_token" not in c[2]]
+    assert searches and all(c[2].get("include_airlines") == "6E" for c in searches)
+    first = env.gh.bodies(9)[1]
+    assert "₹7,300" in first and "6E 9105" in first and "AI 9612" not in first and "₹6,100" not in first
+    assert "IndiGo only" in env.gh.bodies(9)[0]
+    env.db.close()

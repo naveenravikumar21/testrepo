@@ -192,7 +192,8 @@ class Monitor:
         plan: dict[tuple, dict] = {}
         for w in due:
             for d in w.active_dates(self.today):
-                p = plan.setdefault((w.origin, w.destination, d), {"max_stops": 0, "targets": [], "stops": set()})
+                p = plan.setdefault((w.origin, w.destination, d, tuple(sorted(w.airlines))),
+                                    {"max_stops": 0, "targets": [], "stops": set()})
                 p["max_stops"] = max(p["max_stops"], w.max_stops)
                 p["stops"].add(w.max_stops)
                 if w.target:
@@ -216,13 +217,13 @@ class Monitor:
         min_ver = cfg.verification.alert_min_status
         searched: dict[tuple, bool] = {}
         for key in keys:
-            origin, dest, d = key
+            origin, dest, d, carriers = key
             info = plan[key]
             ok_any = False
             for provider in providers:
                 result.searches += 1
                 try:
-                    options, meta = provider.search(origin, dest, d, info["max_stops"])
+                    options, meta = provider.search(origin, dest, d, info["max_stops"], carriers)
                 except ProviderError as exc:
                     self._search_failed(result, provider, key, str(exc))
                     continue
@@ -242,6 +243,8 @@ class Monitor:
                 if rejected:
                     log.info("%s %s: rejected %s", provider.name, key,
                              "; ".join(f"{k} x{v}" for k, v in list(rejected.items())[:6]))
+                if carriers:  # keep only itineraries where every leg is on a chosen airline
+                    valid = [o for o in valid if all(fn.split(" ")[0] in carriers for fn in o.flight_numbers)]
                 valid.sort(key=lambda o: (o.price, o.duration_minutes))
 
                 # Confirm the cheapest option for each stops-limit a watch uses, only if it could matter.
@@ -254,7 +257,8 @@ class Monitor:
                         break
                     cands = [o for o in valid if o.stops <= max_stops]
                     for cand in cands[:2]:
-                        prev = db.previous_low(origin, dest, d.isoformat(), int(min_ver), max_stops, run_id)
+                        prev = db.previous_low(origin, dest, d.isoformat(), int(min_ver), max_stops, run_id,
+                                               carriers)
                         # Compare search price with search price: seller quotes are often a little higher
                         # than the search price, so comparing against the quote would re-confirm every time.
                         ref = None if prev is None else (prev["search_price"] or prev["price"])
@@ -308,7 +312,9 @@ class Monitor:
         for key, ok in searched.items():
             if not ok:
                 continue
-            origin, dest, d = key
+            origin, dest, d, carriers = key
+            if carriers:
+                continue  # route-wide record lows only from unfiltered searches
             rows = db.run_observations(run_id, origin, dest, d.isoformat(), int(min_ver), cfg.defaults.max_stops)
             if not rows:
                 continue
@@ -319,12 +325,14 @@ class Monitor:
 
         # ---- per-watch alerts and status ----------------------------------------------------------
         for w in due:
-            dates = [d for d in w.active_dates(self.today) if searched.get((w.origin, w.destination, d))]
-            if not dates and not any((w.origin, w.destination, d) in searched for d in w.active_dates(self.today)):
+            wkey = (w.origin, w.destination)
+            carriers = tuple(sorted(w.airlines))
+            dates = [d for d in w.active_dates(self.today) if searched.get((*wkey, d, carriers))]
+            if not dates and not any((*wkey, d, carriers) in searched for d in w.active_dates(self.today)):
                 continue  # nothing searched for this watch (budget)
             result.watches_checked += 1
-            infos = watch_infos(db, cfg, w, run_id, errored={d for (o, de, d), ok in searched.items()
-                                                             if not ok and o == w.origin and de == w.destination})
+            infos = watch_infos(db, cfg, w, run_id, errored={d for (o, de, d, c), ok in searched.items()
+                                                             if not ok and (o, de, c) == (*wkey, carriers)})
             items = decide_watch_alerts(db, run_id, w, dates, cfg, self.now)
             first = db.kv_get(f"first_results|{w.id}") is None
             msg = None
@@ -360,7 +368,7 @@ class Monitor:
         return watch_from_row(row).estimate_searches_30d(self.today)
 
     def _search_failed(self, result: RunResult, provider, key, error: str):
-        origin, dest, d = key
+        origin, dest, d, _ = key
         result.failed_searches += 1
         result.errors.append(f"{provider.name} {origin}-{dest} {d}: {error}")
         log.error("Search failed: %s %s-%s %s: %s", provider.name, origin, dest, d, error)

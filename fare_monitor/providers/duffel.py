@@ -50,7 +50,7 @@ class DuffelProvider(Provider):
 
     @property
     def verify_budget(self) -> int:
-        return int(self.settings.get("verify_top_n", 3))
+        return int(self.settings.get("verify_top_n", 1))
 
     def _headers(self) -> dict:
         return {
@@ -72,21 +72,22 @@ class DuffelProvider(Provider):
             raise ProviderError(f"Duffel {what}: HTTP {resp.status_code} {msg}")
         return payload
 
-    def search(self, travel_date: date):
-        trip = self.config.trip
+    def search(self, origin: str, destination: str, travel_date: date, max_stops: int = 2):
+        d = self.config.defaults
         body = {
             "data": {
                 "slices": [{
-                    "origin": trip.origin,
-                    "destination": trip.destination,
+                    "origin": origin,
+                    "destination": destination,
                     "departure_date": travel_date.isoformat(),
                 }],
-                "passengers": [{"type": "adult"} for _ in range(trip.adults)],
-                "cabin_class": trip.cabin,
-                "max_connections": int(self.settings.get("max_connections", 2)),
+                "passengers": [{"type": "adult"} for _ in range(d.adults)],
+                "cabin_class": d.cabin,
+                "max_connections": min(max_stops, int(self.settings.get("max_connections", 2))),
             }
         }
         params = {"return_offers": "true", "supplier_timeout": int(self.settings.get("supplier_timeout_ms", 20000))}
+        self.calls += 1
         try:
             resp = self.session.post(f"{API}/air/offer_requests", params=params, json=body,
                                      headers=self._headers(), timeout=60)
@@ -99,7 +100,7 @@ class DuffelProvider(Provider):
         observed_at = _utcnow().isoformat(timespec="seconds")
         options = []
         for offer in data.get("offers") or []:
-            opt = self._parse_offer(offer, travel_date, observed_at, Verification.INDICATIVE,
+            opt = self._parse_offer(offer, origin, destination, travel_date, observed_at, Verification.INDICATIVE,
                                     "Offer returned by Duffel search; not yet re-priced")
             if opt:
                 options.append(opt)
@@ -107,6 +108,7 @@ class DuffelProvider(Provider):
         return options, meta
 
     def verify(self, option: FareOption) -> FareOption | None:
+        self.calls += 1
         try:
             resp = self.session.get(f"{API}/air/offers/{option.offer_ref}", headers=self._headers(), timeout=45)
         except Exception as exc:
@@ -130,10 +132,11 @@ class DuffelProvider(Provider):
         new_price = float(offer.get("total_amount") or 0)
         if abs(new_price - option.price) >= 0.01:
             note += f" (search price {option.price:.2f} -> {new_price:.2f})"
-        return self._parse_offer(offer, date.fromisoformat(option.travel_date), observed_at,
+        return self._parse_offer(offer, option.origin, option.destination, date.fromisoformat(option.travel_date),
+                                 observed_at,
                                  Verification.VERIFIED, note)
 
-    def _parse_offer(self, offer: dict, travel_date: date, observed_at: str,
+    def _parse_offer(self, offer: dict, origin: str, destination: str, travel_date: date, observed_at: str,
                      verification: Verification, note: str) -> FareOption | None:
         try:
             slices = offer.get("slices") or []
@@ -168,6 +171,8 @@ class DuffelProvider(Provider):
             return FareOption(
                 provider=self.name,
                 source=self.display_name,
+                origin=origin,
+                destination=destination,
                 travel_date=travel_date.isoformat(),
                 airline=" + ".join(airlines),
                 flight_numbers=flight_numbers,
@@ -181,8 +186,7 @@ class DuffelProvider(Provider):
                 verification=verification,
                 verification_note=note,
                 observed_at=observed_at,
-                booking_url=airline_site(carrier_code, self.config.trip.origin,
-                                         self.config.trip.destination, travel_date),
+                booking_url=airline_site(carrier_code, origin, destination, travel_date),
                 seller=owner.get("name", "") + " (Duffel offer)",
                 cabin_baggage=cabin_bags,
                 checked_baggage=checked_bags,

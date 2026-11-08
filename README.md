@@ -1,150 +1,128 @@
-# ✈️ Jaipur → Kochi fare monitor
+# ✈️ Flight fare watch
 
-An automated agent that watches **one-way, economy, 1-adult** fares from **Jaipur (JAI)** to
-**Kochi (COK)** for **4 January 2027** and **5 January 2027**. It runs every hour on GitHub Actions and
-stores every verified observation in SQLite. It sends a Telegram and/or email alert when a meaningful new
-opportunity appears.
+Tracks one-way economy fares (1 adult, INR) for the routes and dates you choose. It emails you through
+GitHub when a fare is worth booking. It runs free on GitHub Actions, with prices from Google Flights through
+SerpApi, inside SerpApi's free plan of 250 searches a month.
 
-* Sources: authorised APIs only, no HTML scraping. **Duffel** provides live airline offers that are
-  re-priced to `VERIFIED`. **Google Flights via SerpApi** provides seller-quoted final prices from airlines
-  and OTAs such as MakeMyTrip, Cleartrip and ixigo.
-* Prices are never invented, estimated or currency-converted. Search-only prices are labelled
-  `INDICATIVE` and never trigger alerts by default.
-* **It never books or pays.** Booking links only open the seller's site.
+* **You choose:** route, dates or a date range, how often to check, and your book-now price, using a form.
+* **You get:** an email when a **confirmed** fare is under your price, beats the lowest seen so far, or a
+  new cheaper flight appears. You also get a quietly-updated status comment and a dashboard page.
+* **It never books or pays.** Prices are never invented or converted. Search-only prices are marked
+  *indicative* and are confirmed with the seller before any alert.
 
-Architecture, data sources, verification rules and the alert logic are in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+## Using it
 
-```
-fare_monitor/
-  providers/duffel.py           Duffel offer request + GET /air/offers re-pricing  -> VERIFIED
-  providers/serpapi_google.py   Google Flights search + booking options           -> SELLER_QUOTED
-  analysis.py                   validation, preferences, record-low / alert decisions
-  runner.py                     one hourly cycle
-  db.py                         SQLite schema + queries
-  notify/                       telegram | email | console
-  messages.py, report.py        alert text, daily summary, HTML dashboard, job summary
-config/monitor.toml             all non-secret settings (thresholds, filters, providers, channels)
-.github/workflows/monitor.yml   hourly scheduler, state persistence, auto-stop
-.github/workflows/ci.yml        tests on every push
-```
+### Start watching a trip
+1. In the repository, open **Issues → New issue → Fare watch → Get started**.
+2. Fill in the form:
+   - From and To: an airport code like JAI or COK, or a city name like Jaipur or Kochi.
+   - Travel dates: for example `2027-01-04, 2027-01-05`, or `2 Jan 2027 to 6 Jan 2027`.
+   - How often to check: every day, 3 times a week, 2 times a week or once a week. You can instead tick
+     the exact days.
+   - Book-now price.
+   - Stops.
+3. Press **Submit**. Within a few minutes you'll see two comments, and get emails for them:
+   - **Watch set up**: what will be checked and how many searches it will use. This comment becomes the
+     **Latest status** and is edited quietly after every check.
+   - **First prices**: the cheapest fare for each date and Google's price trend (low / typical / high,
+     rising or falling).
 
----
+After that, checks run at about **7 AM IST** on the days you chose. You only get an email when one of
+these happens:
 
-## Deployment (about 20 minutes)
-
-### 1. Get fare-source credentials (at least one; both is best)
-
-| Secret | Where | Notes |
-|---|---|---|
-| `SERPAPI_API_KEY` | <https://serpapi.com> → Dashboard → API key | Default settings use up to **6 searches/hour** (1 search + 2 booking checks per date), about **4,300/month**. Pick a plan that covers this, or set `booking_checks_per_date = 1` in `config/monitor.toml` (about 2,900/month). Searches use `no_cache=true`, so no stale cached prices are served. |
-| `DUFFEL_ACCESS_TOKEN` | <https://app.duffel.com> → Developers → Access tokens | Must be a **live-mode** token: test mode only returns the fictional "Duffel Airways", and the monitor refuses it. Live mode requires completing Duffel's account verification. Check Duffel's current pricing for search-to-book ratio charges. Coverage of Indian domestic carriers depends on your Duffel account. If Duffel returns no JAI→COK offers, the dashboard shows the search as `empty`, and Google Flights still covers the route. |
-
-### 2. Create the notification channel
-
-**Telegram (recommended)**
-1. In Telegram, open **@BotFather** → `/newbot` → copy the token (`TELEGRAM_BOT_TOKEN`).
-2. Send any message to your new bot.
-3. Open `https://api.telegram.org/bot<TOKEN>/getUpdates` and copy `message.chat.id` (`TELEGRAM_CHAT_ID`).
-   Several chat IDs can be comma-separated.
-
-**Email (optional or additional)**: any SMTP server. For Gmail, use an
-[app password](https://myaccount.google.com/apppasswords) with host `smtp.gmail.com`, port 587.
-Secrets: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`
-(comma-separated). Set the repository variable `SMTP_USE_SSL=true` for port 465.
-
-### 3. Add GitHub secrets and variables
-
-Repository → **Settings → Secrets and variables → Actions**.
-
-*Secrets*: the keys above (`SERPAPI_API_KEY`, `DUFFEL_ACCESS_TOKEN`, `TELEGRAM_BOT_TOKEN`,
-`TELEGRAM_CHAT_ID`, and the SMTP/email ones if used).
-
-*Variables* (all optional):
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `NOTIFY_CHANNELS` | `telegram` | `telegram`, `email`, `console`, comma-separated, e.g. `telegram,email` |
-| `TARGET_FARE_INR` | off | Alert whenever a verified fare is at or below this amount |
-| `ALERT_MIN_STATUS` | `seller_quoted` | `verified` = only Duffel re-priced offers can alert. `indicative` is not recommended |
-| `PROVIDERS` | `duffel,serpapi_google_flights` | Restrict sources |
-| `DAILY_SUMMARY_HOUR` | `8` | Hour (IST) after which the daily summary is sent |
-| `DASHBOARD_URL` | — | Put your GitHub Pages URL here so the summary links to it |
-| `MONITOR_ENABLED` | `true` | Set to `false` to pause (manual stop) |
-
-### 4. Merge to the default branch and test
-
-GitHub only runs scheduled workflows from the **default branch**. Merge this branch into it, or make this
-branch the default. Then go to **Actions → "Fare monitor (JAI → COK)" → Run workflow**:
-
-1. `command = test-notify`: you should receive a test message on every configured channel.
-2. `command = run` with **dry run** ticked: a full search with alerts printed in the log only. State is
-   not saved.
-3. `command = run`: the first real cycle. You get one **baseline** message per date, and the `fare-data`
-   branch appears with `fares.sqlite3`, `index.html`, `summary.md` and `summary.json`.
-
-From then on it runs every hour at :17 (GitHub may delay scheduled runs by a few minutes under load).
-
-### 5. Dashboard
-
-* Every run's **job summary** (Actions → run) shows the current lowest fares and source status.
-* `index.html` on the `fare-data` branch is the full dashboard. It shows:
-  * lowest fare for 4 Jan, for 5 Jan, and overall
-  * all-time lows
-  * the hourly price trend
-  * an airline comparison
-  * every option from the latest search, with baggage and booking links
-  * source and verification status
-  * alert history
-
-  To publish it, open **Settings → Pages → Deploy from a branch → `fare-data` / root**. Pages on private
-  repositories needs a paid GitHub plan. On a public repository the dashboard and database are public:
-  they hold route, dates and fares, no personal data.
-* Or download the `fare-state-<run id>` artifact from any run and open `index.html` locally.
-
----
-
-## Operating it
-
-| Task | How |
+| Alert | When |
 |---|---|
-| Pause / stop | Set the variable `MONITOR_ENABLED=false`, or Actions → workflow → **Disable workflow** |
-| Automatic stop | After 5 Jan 2027 (IST) the next run sends a final summary and disables the workflow itself |
-| Change thresholds/filters | Edit `config/monitor.toml` (all keys are commented) and push |
-| Send the summary now | Run workflow with `command = send-summary` |
-| Failures | A run where every search fails ends red, so GitHub emails you. After 3 such runs in a row you also get an operations alert on Telegram/email, then a "recovered" message when searches succeed again. Partial failures (one source down) are listed on the dashboard |
-| Inspect data | Download `fares.sqlite3` from the `fare-data` branch: `sqlite3 fares.sqlite3 "select travel_date, airline, flight_numbers, price, verification, observed_at from observations order by price limit 20"` |
+| 🎯 Fare under your book-now price | A seller-confirmed fare is at or below your price (once per flight and price) |
+| 📉 New lowest fare | It beats the lowest confirmed fare by at least ₹200 **and** 2% |
+| 🆕 New cheaper flight | A flight not seen before (or not for 3+ days) is bookable within 5% of the lowest fare |
+| ⚠️ / ✅ Problem / recovered | Checks failed twice in a row, or are working again |
+| 🏁 Watch finished | The dates have passed; the issue is closed automatically |
 
-### What the alerts contain
+Each alert includes:
+- the fare and the previous lowest, with the difference and percentage
+- airline and flight numbers
+- departure and arrival times, journey time, stops and layovers
+- baggage, where the seller gives it
+- who quoted the price, and when it was checked
+- a booking link
 
-New fare, previous lowest, difference and percentage drop, airline and flight numbers, travel date,
-departure and arrival times, total duration, stops and layovers (airport and length), baggage where the
-source provides it, verification status and source/seller, booking link and verification timestamp. The
-cheapest fare across both dates is added at the end.
+**Change a watch:** edit the issue description; it's checked again straight away. **Stop it:** close the
+issue. You can have several watches at once.
+
+### Emails
+GitHub sends these to your account's notification email (**github.com → Settings → Notifications →
+Default notification email**). The GitHub mobile app can also push them to your phone.
+
+### Dashboard
+There's a web page with the lowest fares per date, a trend chart, an airline comparison, every option with
+booking links, and searches used this month.
+* One-time setup: **Settings → Pages → Build and deployment → Source: GitHub Actions**.
+* Address: `https://<your-username>.github.io/<repository>/`. For this repository that is
+  https://naveenravikumar21.github.io/testrepo/.
+
+### Staying inside the free 250 searches a month
+Each date costs **1 search per check**. Confirming a seller's final price costs 1 more, and only happens
+when an alert is possible.
+
+| Watch | Searches a month (approx.) |
+|---|---|
+| 2 dates, every day | ~70 |
+| 2 dates, 3 times a week | ~30 |
+| 5-day range, 2 times a week | ~45 |
+
+The **Watch set up** comment shows the estimate for all your watches together. If SerpApi says fewer than
+20 searches are left, checks pause until the 1st of the month and you get a comment. Soonest travel dates
+are checked first.
+
+### Pausing everything
+Set the repository variable `MONITOR_ENABLED` to `false`, under **Settings → Secrets and variables →
+Actions → Variables**. Alternatively, disable the **Fare monitor** workflow in the Actions tab.
 
 ---
+
+## Setup (already done for this repository)
+
+1. Create a free SerpApi account (serpapi.com) and copy the API key.
+2. Go to **Settings → Secrets and variables → Actions → New repository secret**, name it
+   `SERPAPI_API_KEY` and paste the key.
+3. Enable Pages (see Dashboard above). This is optional.
+
+Optional repository variables:
+
+| Variable | Meaning |
+|---|---|
+| `SERPAPI_MONTHLY_LIMIT` | Your plan's searches per month, if you upgrade (default 250) |
+| `NOTIFY_CHANNELS` | `github` (default); add `email` (needs `SMTP_*` secrets) or `telegram` |
+| `ALERT_MIN_STATUS` | `seller_quoted` (default) or `verified` |
+| `DASHBOARD_URL` | Override the dashboard address used in comments |
+
+Thresholds and filters are in `config/monitor.toml`, and every key there is commented. The filters are
+maximum journey time, departure window, minimum and maximum layover, and the alert thresholds.
+
+## How it works
+
+The diagram and design details are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+* `.github/workflows/monitor.yml` runs daily at 07:05 IST, and also when a Fare-watch issue is opened or
+  edited. Only issues from the repository owner or collaborators count, so strangers can't spend your
+  searches.
+* `fare_monitor/watches.py` reads the issue form.
+* `fare_monitor/runner.py` does the following each check:
+  1. Decides which watches are due.
+  2. Checks the search budget.
+  3. Searches each route and date once, even if several watches want it.
+  4. Confirms the seller price only when it could trigger an alert.
+  5. Stores everything in SQLite.
+  6. Posts alerts and status.
+* The database is kept on the `fare-data` branch, and each run is also backed up as a 14-day artifact.
 
 ## Local development
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-python -m pytest -q                                  # 18 tests, synthetic API responses, no network
-export SERPAPI_API_KEY=... TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...
-python -m fare_monitor check-config                  # which sources/channels are configured
-python -m fare_monitor test-notify                   # send a test message
-python -m fare_monitor run --dry-run                 # real search, alerts printed to console
-python -m fare_monitor run                           # real cycle; state in ./state/
-python -m fare_monitor report                        # rebuild ./state/index.html
+python -m pytest -q                      # synthetic API responses, no network
+export SERPAPI_API_KEY=... TRAVEL_DATES=2027-01-04,2027-01-05
+python -m fare_monitor run --dry-run     # local check, messages printed to the console
+python -m fare_monitor report            # rebuild state/index.html
 ```
-
-Commands exit with status 0 for ok or partial runs, 1 when every search failed, and 2 for a
-configuration error.
-
-## Safety notes
-
-* No ordering or payment endpoint is called anywhere in the code (Duffel is used only for
-  `offer_requests` and `offers`).
-* Indicative prices are shown with a grey `INDICATIVE` badge. They are never presented as bookable and
-  never alert under the default settings.
-* Fares can change between verification and payment. Every message says so.

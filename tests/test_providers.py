@@ -25,7 +25,7 @@ def test_serpapi_search_and_seller_quote(config):
     m = Market(serp={"2027-01-04": [direct_6e("2027-01-04", 6200, seller=6350), via_bom_ai("2027-01-04", 7100)]})
     session = FakeSession(serp_handler(m))
     p = SerpApiGoogleFlightsProvider(config, session)
-    options, meta = p.search(D4)
+    options, meta = p.search("JAI", "COK", D4, 2)
     assert [o.price for o in options] == [6200, 7100]
     o = options[0]
     assert o.verification == Verification.INDICATIVE
@@ -47,20 +47,20 @@ def test_serpapi_search_and_seller_quote(config):
 
 def test_serpapi_no_results_is_empty_not_error(config):
     p = SerpApiGoogleFlightsProvider(config, FakeSession(serp_handler(Market())))
-    options, _ = p.search(D4)
+    options, _ = p.search("JAI", "COK", D4, 2)
     assert options == []
 
 
 def test_serpapi_error_raises(config):
     p = SerpApiGoogleFlightsProvider(config, FakeSession(serp_handler(Market(serp_fail=True))))
     with pytest.raises(ProviderError):
-        p.search(D4)
+        p.search("JAI", "COK", D4, 2)
 
 
 def test_duffel_search_verify(config):
     m = Market(duffel={"2027-01-04": [via_bom_ai("2027-01-04", 6900)]})
     p = DuffelProvider(config, FakeSession(duffel_handler(m)))
-    options, meta = p.search(D4)
+    options, meta = p.search("JAI", "COK", D4, 2)
     assert len(options) == 1 and options[0].verification == Verification.INDICATIVE
     o = options[0]
     assert o.flight_numbers == ["AI 9612", "AI 9681"] and o.layovers[0].minutes == 90
@@ -76,14 +76,14 @@ def test_duffel_search_verify(config):
 def test_duffel_test_mode_refused(config):
     m = Market(duffel={"2027-01-04": [via_bom_ai("2027-01-04", 6900)]}, duffel_live=False)
     with pytest.raises(ProviderError, match="TEST mode"):
-        DuffelProvider(config, FakeSession(duffel_handler(m))).search(D4)
+        DuffelProvider(config, FakeSession(duffel_handler(m))).search("JAI", "COK", D4, 2)
 
 
 def test_duffel_http_error(config):
     p = DuffelProvider(config, FakeSession(lambda *a: FakeResponse(401, {"errors": [{"code": "unauthorized",
                                                                                     "message": "bad token"}]})))
     with pytest.raises(ProviderError, match="unauthorized"):
-        p.search(D4)
+        p.search("JAI", "COK", D4, 2)
 
 
 def test_validation_rules(config):
@@ -94,7 +94,7 @@ def test_validation_rules(config):
         Itin([("6E 3", "IndiGo", "JAI", "BOM", "2027-01-04 06:00", "2027-01-04 07:40"),
               ("6E 4", "IndiGo", "BOM", "COK", "2027-01-04 08:00", "2027-01-04 10:00")], 5000),
     ]})
-    options, _ = DuffelProvider(config, FakeSession(duffel_handler(m))).search(D4)
+    options, _ = DuffelProvider(config, FakeSession(duffel_handler(m))).search("JAI", "COK", D4, 2)
     reasons = [validate(o, D4, config) for o in options]
     assert reasons[0] is None
     assert "currency" in reasons[1]

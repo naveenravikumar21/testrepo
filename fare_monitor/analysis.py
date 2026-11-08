@@ -1,8 +1,7 @@
-"""Validation, preference filtering, ranking and alert decisions."""
+"""Validation, ranking, seller-check gating and per-watch alert decisions."""
 from __future__ import annotations
 
 import json
-import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
@@ -13,15 +12,15 @@ from .models import FareOption, Layover, fmt_minutes
 # ---- validation ----------------------------------------------------------------------------------
 def validate(opt: FareOption, travel_date: date, config: Config, now: datetime | None = None) -> str | None:
     """Return a rejection reason, or None if the option is a usable, trustworthy observation."""
-    trip, prefs, ver = config.trip, config.preferences, config.verification
+    prefs, ver = config.preferences, config.verification
     now = now or datetime.now(timezone.utc)
-    if opt.currency.upper() != trip.currency:
-        return f"currency {opt.currency} != {trip.currency} (prices are never converted or estimated)"
+    if opt.currency.upper() != config.defaults.currency:
+        return f"currency {opt.currency} != {config.defaults.currency} (prices are never converted or estimated)"
     if opt.travel_date != travel_date.isoformat() or not opt.departure_local.startswith(travel_date.isoformat()):
         return f"departure {opt.departure_local} is not on {travel_date}"
     origin, dest = opt.extra.get("origin"), opt.extra.get("destination")
-    if (origin and origin != trip.origin) or (dest and dest != trip.destination):
-        return f"route {origin}-{dest} does not match {trip.origin}-{trip.destination}"
+    if (origin and origin != opt.origin) or (dest and dest != opt.destination):
+        return f"route {origin}-{dest} does not match {opt.origin}-{opt.destination}"
     if not (ver.min_plausible_fare <= opt.price <= ver.max_plausible_fare):
         return f"implausible fare {opt.price}"
     if opt.expires_at:
@@ -30,8 +29,8 @@ def validate(opt: FareOption, travel_date: date, config: Config, now: datetime |
                 return "offer expired"
         except ValueError:
             pass
-    if opt.stops > prefs.max_stops:
-        return f"{opt.stops} stops > {prefs.max_stops}"
+    if opt.stops > config.defaults.max_stops:
+        return f"{opt.stops} stops > {config.defaults.max_stops}"
     if opt.duration_minutes <= 0 or opt.duration_minutes > prefs.max_duration_minutes:
         return f"duration {fmt_minutes(opt.duration_minutes)} outside limit"
     dep_time = datetime.fromisoformat(opt.departure_local).time()
@@ -44,9 +43,31 @@ def validate(opt: FareOption, travel_date: date, config: Config, now: datetime |
     return None
 
 
-def value_score(opt_price: float, duration_minutes: int, stops: int, config: Config) -> float:
+def value_score(price: float, duration_minutes: int, stops: int, config: Config) -> float:
     p = config.preferences
-    return round(opt_price + p.value_inr_per_hour * duration_minutes / 60 + p.value_inr_per_stop * stops, 2)
+    return round(price + p.value_inr_per_hour * duration_minutes / 60 + p.value_inr_per_stop * stops, 2)
+
+
+# ---- seller-check gating -------------------------------------------------------------------------
+def needs_confirmation(opt: FareOption, prev_low_search_price: float | None, targets: list[float], db, config: Config,
+                       now: datetime) -> str | None:
+    """Should we spend a search confirming this option's final price? Returns the reason or None.
+
+    Confirmation costs one SerpApi search, so it is only done when the result could change what you
+    are told: the first price for a date, a possible new record low, or a fare at/below a book-now price
+    that hasn't been confirmed in the last few days."""
+    min_ver = int(config.verification.alert_min_status)
+    if opt.verification >= config.verification.alert_min_status:
+        return None
+    if prev_low_search_price is None:
+        return "first price for this date"
+    if opt.price < prev_low_search_price - 0.5:
+        return "possible new record low"
+    if any(opt.price <= t for t in targets):
+        since = now - timedelta(hours=config.verification.reverify_after_hours)
+        if db.recent_confirmation(opt.flight_key, min_ver, since) is None:
+            return "at or below a book-now price"
+    return None
 
 
 # ---- row helpers ---------------------------------------------------------------------------------
@@ -67,8 +88,8 @@ def row_view(row) -> dict:
 
 # ---- alert decisions -----------------------------------------------------------------------------
 @dataclass
-class AlertCandidate:
-    kind: str                      # baseline | record_low | attractive | new_availability
+class AlertItem:
+    kind: str                      # record_low | under_target | new_flight
     travel_date: str
     observation: dict
     previous_low: float | None
@@ -88,94 +109,68 @@ class AlertCandidate:
         return round(100.0 * (self.previous_low - self.observation["price"]) / self.previous_low, 2)
 
 
-KIND_PRIORITY = {"record_low": 0, "attractive": 1, "new_availability": 2, "baseline": 3}
-KEY_KIND = {"record_low": "record_low", "target": "attractive", "attractive": "attractive",
-            "new": "new_availability", "baseline": "baseline"}
+KIND_PRIORITY = {"record_low": 0, "under_target": 1, "new_flight": 2}
+KEY_KIND = {"low": "record_low", "target": "under_target", "new": "new_flight"}
 
 
-def decide_alerts(db, run_id: int, config: Config, now: datetime) -> tuple[list[AlertCandidate], list[dict]]:
-    """Return (alerts to send, record lows to persist). Pure decision logic over the database."""
+def decide_watch_alerts(db, run_id: int, watch, dates: list[date], config: Config, now: datetime) -> list[AlertItem]:
+    """Alerts for one watch from the observations stored in this run (only confirmed prices count)."""
     min_ver = int(config.verification.alert_min_status)
     a = config.alerts
-    candidates: dict[int, AlertCandidate] = {}
-    record_lows: list[dict] = []
+    items: dict[int, AlertItem] = {}
 
     def add(kind, obs, prev, reason, key):
-        cand = candidates.get(obs["id"])
-        if cand is None:
-            cand = candidates[obs["id"]] = AlertCandidate(kind, obs["travel_date"], obs, prev)
-        elif KIND_PRIORITY[kind] < KIND_PRIORITY[cand.kind]:
-            cand.kind = kind
-        cand.reasons.append(reason)
-        cand.dedup_keys.append(key)
+        item = items.setdefault(obs["id"], AlertItem(kind, obs["travel_date"], obs, prev))
+        item.reasons.append(reason)
+        item.dedup_keys.append(key)
 
-    for travel_date in (d.isoformat() for d in config.trip.dates):
-        best_row = db.run_best(run_id, travel_date, min_ver)
-        if best_row is None:
+    for d in dates:
+        ds = d.isoformat()
+        rows = db.run_observations(run_id, watch.origin, watch.destination, ds, min_ver, watch.max_stops)
+        if not rows:
             continue
-        best = row_view(best_row)
-        prev_row = db.previous_low(travel_date, min_ver, run_id)
+        best = row_view(rows[0])
+        prev_row = db.previous_low(watch.origin, watch.destination, ds, min_ver, watch.max_stops, run_id)
         prev_low = prev_row["price"] if prev_row else None
-        price_key = f"{best['flight_key']}|{best['price']:.0f}"
+        price_key = f"{watch.id}|{best['flight_key']}|{best['price']:.0f}"
 
-        # 1. record lows
-        if prev_low is None:
-            record_lows.append({"travel_date": travel_date, "observation_id": best["id"], "price": best["price"],
-                                "previous_low": None})
-            if a.send_baseline:
-                add("baseline", best, None, "First verified fare recorded for this date (baseline)",
-                    f"baseline|{travel_date}")
-        elif best["price"] < prev_low - 0.005:
-            record_lows.append({"travel_date": travel_date, "observation_id": best["id"], "price": best["price"],
-                                "previous_low": prev_low})
+        if prev_low is not None and best["price"] < prev_low - 0.005:
             drop = prev_low - best["price"]
-            pct = 100 * drop / prev_low
-            if drop >= a.min_drop_inr and pct >= a.min_drop_pct:
-                add("record_low", best, prev_low, f"New record low (down {pct:.1f}%)",
-                    f"record_low|{price_key}")
-
-        # 2. particularly attractive fares
-        if a.target_fare_inr and best["price"] <= a.target_fare_inr:
-            add("attractive", best, prev_low, f"At or below your target fare of ₹{a.target_fare_inr:,.0f}",
+            if drop >= a.min_drop_inr and 100 * drop / prev_low >= a.min_drop_pct:
+                add("record_low", best, prev_low, f"New lowest confirmed fare (down {100 * drop / prev_low:.1f}%)",
+                    f"low|{price_key}")
+        if watch.target and best["price"] <= watch.target:
+            add("under_target", best, prev_low, f"At or below your book-now price of ₹{watch.target:,.0f}",
                 f"target|{price_key}")
-        history = [r["price"] for r in db.hourly_lows(travel_date, min_ver, since=now - timedelta(days=7))
-                   if r["run_id"] != run_id]
-        if len(history) >= a.attractive_min_history:
-            median = statistics.median(history)
-            threshold = median * (1 - a.attractive_below_median_pct / 100)
-            if best["price"] <= threshold:
-                add("attractive", best, prev_low,
-                    f"{100 * (median - best['price']) / median:.0f}% below the 7-day median low (₹{median:,.0f})",
-                    f"attractive|{price_key}")
 
-        # 3. previously unavailable flights that are now bookable at a competitive price
-        if db.date_had_successful_search_before(travel_date, run_id):
+        if db.route_had_search_before(watch.origin, watch.destination, ds, run_id):
             ceiling = best["price"] * (1 + a.competitive_pct / 100)
-            seen_keys = set()
-            for row in db.run_observations(run_id, travel_date, min_ver):
+            if watch.target:
+                ceiling = min(ceiling, watch.target)
+            seen = set()
+            for row in rows:
                 obs = row_view(row)
-                if obs["price"] > ceiling or obs["flight_key"] in seen_keys:
+                if obs["price"] > ceiling or obs["flight_key"] in seen:
                     continue
-                seen_keys.add(obs["flight_key"])
+                seen.add(obs["flight_key"])
                 last_seen = db.flight_last_seen_before(obs["flight_key"], run_id)
                 if last_seen is None:
-                    why = "Flight not seen in any earlier search"
-                elif now - datetime.fromisoformat(last_seen) >= timedelta(hours=a.reappear_after_hours):
-                    why = f"Flight back after being unavailable since {last_seen[:16].replace('T', ' ')} UTC"
+                    why = "A flight not seen in earlier checks"
+                elif now - datetime.fromisoformat(last_seen) >= timedelta(days=a.reappear_after_days):
+                    why = f"A flight that was unavailable since {last_seen[:10]}"
                 else:
                     continue
-                add("new_availability", obs, prev_low,
-                    f"{why}; bookable within {a.competitive_pct:g}% of the current lowest fare",
-                    f"new|{obs['flight_key']}|{obs['price']:.0f}")
+                add("new_flight", obs, prev_low, f"{why} is now bookable at a competitive price",
+                    f"new|{watch.id}|{obs['flight_key']}|{obs['price']:.0f}")
 
-    alerts = []
-    for cand in candidates.values():
-        fresh = [(r, k) for r, k in zip(cand.reasons, cand.dedup_keys) if not db.alert_exists(k)]
-        if fresh:
-            cand.reasons = [r for r, _ in fresh]
-            cand.dedup_keys = [k for _, k in fresh]
-            kinds = [KEY_KIND[k.split("|", 1)[0]] for k in cand.dedup_keys]
-            cand.kind = min(kinds, key=KIND_PRIORITY.__getitem__)
-            alerts.append(cand)
-    alerts.sort(key=lambda c: (KIND_PRIORITY[c.kind], c.observation["price"]))
-    return alerts, record_lows
+    out = []
+    for item in items.values():
+        fresh = [(r, k) for r, k in zip(item.reasons, item.dedup_keys) if not db.alert_exists(k)]
+        if not fresh:
+            continue
+        item.reasons = [r for r, _ in fresh]
+        item.dedup_keys = [k for _, k in fresh]
+        item.kind = min((KEY_KIND[k.split("|", 1)[0]] for k in item.dedup_keys), key=KIND_PRIORITY.__getitem__)
+        out.append(item)
+    out.sort(key=lambda i: (KIND_PRIORITY[i.kind], i.observation["price"]))
+    return out

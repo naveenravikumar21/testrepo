@@ -40,6 +40,10 @@ class FakeSession:
         self.calls.append(("POST", url, params, json))
         return self.handler("POST", url, params or {}, json)
 
+    def patch(self, url, params=None, json=None, headers=None, timeout=None, **kw):
+        self.calls.append(("PATCH", url, params, json))
+        return self.handler("PATCH", url, params or {}, json)
+
 
 @dataclass
 class Itin:
@@ -62,6 +66,8 @@ class Market:
     duffel_fail: bool = False
     duffel_live: bool = True
     duffel_reprice: dict = field(default_factory=dict)  # offer key -> new price / None (gone)
+    account: dict | None = None      # SerpApi account.json payload (None = endpoint unavailable)
+    serp_calls: int = 0
 
 
 def _mins(a: str, b: str) -> int:
@@ -71,8 +77,13 @@ def _mins(a: str, b: str) -> int:
 
 def serp_handler(market: Market):
     def handler(method, url, params, body):
+        if url.endswith("/account.json"):
+            if market.account is None:
+                return FakeResponse(500, {"error": "unavailable"})
+            return FakeResponse(200, market.account)
         if market.serp_fail:
             return FakeResponse(503, {"error": "Service temporarily unavailable"})
+        market.serp_calls += 1
         date = params["outbound_date"]
         itins = market.serp.get(date, [])
         if "booking_token" in params:
@@ -110,7 +121,8 @@ def serp_handler(market: Market):
             "search_metadata": {"status": "Success", "google_flights_url": f"https://www.google.com/travel/flights?test={date}"},
             "best_flights": flights[:1], "other_flights": flights[1:],
             "price_insights": {"lowest_price": min(i.price for i in itins), "price_level": "typical",
-                               "typical_price_range": [5000, 9000]}})
+                               "typical_price_range": [5000, 9000],
+                               "price_history": [[1757808000, 6900], [1760400000, 7200], [1762560000, 7400]]}})
     return handler
 
 
@@ -153,7 +165,51 @@ def duffel_handler(market: Market):
     return handler
 
 
-def combined_handler(market: Market, sent: list):
+class FakeGitHub:
+    """In-memory GitHub issues API."""
+
+    def __init__(self):
+        self.issues = {}
+        self.comments = []        # dicts: id, issue, body
+        self.edits = []           # (comment id, body)
+        self.closed = []
+        self.labels_added = []
+        self._id = 1000
+
+    def add_issue(self, number, body, title="[Fare watch] JAI → COK", assoc="OWNER", login="naveenravikumar21"):
+        self.issues[number] = {"number": number, "title": title, "body": body, "author_association": assoc,
+                               "user": {"login": login}, "labels": [], "state": "open",
+                               "html_url": f"https://github.com/o/r/issues/{number}"}
+
+    def bodies(self, issue=None):
+        return [c["body"] for c in self.comments if issue is None or c["issue"] == issue]
+
+    def handle(self, method, url, params, body):
+        path = url.split("api.github.com", 1)[1]
+        parts = path.strip("/").split("/")          # repos/o/r/...
+        rest = parts[3:]
+        if method == "GET" and rest == ["issues"]:
+            return FakeResponse(200, [i for i in self.issues.values() if i["state"] == "open"])
+        if method == "POST" and rest == ["labels"]:
+            return FakeResponse(201, {"name": body["name"]})
+        if method == "POST" and len(rest) == 3 and rest[2] == "comments":
+            self._id += 1
+            self.comments.append({"id": self._id, "issue": int(rest[1]), "body": body["body"]})
+            return FakeResponse(201, {"id": self._id})
+        if method == "POST" and len(rest) == 3 and rest[2] == "labels":
+            self.labels_added.append(int(rest[1]))
+            return FakeResponse(200, [])
+        if method == "PATCH" and rest[:2] == ["issues", "comments"]:
+            self.edits.append((int(rest[2]), body["body"]))
+            return FakeResponse(200, {"id": int(rest[2])})
+        if method == "PATCH" and len(rest) == 2 and rest[0] == "issues":
+            self.issues[int(rest[1])]["state"] = body["state"]
+            self.closed.append(int(rest[1]))
+            return FakeResponse(200, {})
+        raise AssertionError(f"unexpected GitHub call {method} {path}")
+
+
+def combined_handler(market: Market, gh: FakeGitHub | None = None, sent: list | None = None):
     serp, duffel = serp_handler(market), duffel_handler(market)
 
     def handler(method, url, params, body):
@@ -161,22 +217,33 @@ def combined_handler(market: Market, sent: list):
             return serp(method, url, params, body)
         if "api.duffel.com" in url:
             return duffel(method, url, params, body)
-        if "api.telegram.org" in url:
+        if "api.github.com" in url and gh is not None:
+            return gh.handle(method, url, params, body)
+        if "api.telegram.org" in url and sent is not None:
             sent.append(body)
             return FakeResponse(200, {"ok": True})
         raise AssertionError(f"unexpected URL {url}")
     return handler
 
 
+def form_body(dates="2027-01-04, 2027-01-05", freq="Every day", days=(), target="7500", stops="Any (up to 2 stops)",
+              frm="JAI", to="COK"):
+    day_lines = "\n".join(f"- [{'X' if d in days else ' '}] {d}" for d in
+                          ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"])
+    return (f"### From\n\n{frm}\n\n### To\n\n{to}\n\n### Travel dates\n\n{dates}\n\n"
+            f"### How often to check\n\n{freq}\n\n### Check on these days (optional)\n\n{day_lines}\n\n"
+            f"### Book-now price (₹)\n\n{target or '_No response_'}\n\n### Stops\n\n{stops}\n")
+
+
 @pytest.fixture
 def config(tmp_path, monkeypatch):
     for k in ("DUFFEL_ACCESS_TOKEN", "SERPAPI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "NOTIFY_CHANNELS",
-              "PROVIDERS", "TARGET_FARE_INR", "ALERT_MIN_STATUS", "MONITOR_ENABLED", "TRAVEL_DATES"):
+              "PROVIDERS", "TARGET_FARE_INR", "ALERT_MIN_STATUS", "MONITOR_ENABLED", "TRAVEL_DATES", "GITHUB_TOKEN",
+              "GITHUB_REPOSITORY", "SERPAPI_MONTHLY_LIMIT", "DASHBOARD_URL"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
-    monkeypatch.setenv("DUFFEL_ACCESS_TOKEN", "duffel_test_token")
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:abc")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_test")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "naveenravikumar21/testrepo")
     monkeypatch.setenv("FARE_STATE_DIR", str(tmp_path / "state"))
     return load_config(Path(__file__).resolve().parent.parent / "config" / "monitor.toml")
 

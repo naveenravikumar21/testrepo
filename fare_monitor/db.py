@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import FareOption
@@ -13,13 +13,16 @@ CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
     finished_at TEXT,
-    status TEXT NOT NULL DEFAULT 'running',     -- running | ok | partial | failed | skipped
+    trigger TEXT,
+    status TEXT NOT NULL DEFAULT 'running',     -- running | ok | partial | failed | idle | skipped
     notes TEXT
 );
 CREATE TABLE IF NOT EXISTS searches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id INTEGER NOT NULL REFERENCES runs(id),
     provider TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    destination TEXT NOT NULL,
     travel_date TEXT NOT NULL,
     started_at TEXT NOT NULL,
     status TEXT NOT NULL,                       -- ok | empty | error
@@ -28,12 +31,15 @@ CREATE TABLE IF NOT EXISTS searches (
     kept_count INTEGER NOT NULL DEFAULT 0,
     meta_json TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_search_route ON searches(origin, destination, travel_date);
 CREATE TABLE IF NOT EXISTS observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id INTEGER NOT NULL REFERENCES runs(id),
     search_id INTEGER NOT NULL REFERENCES searches(id),
     provider TEXT NOT NULL,
     source TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    destination TEXT NOT NULL,
     travel_date TEXT NOT NULL,
     flight_key TEXT NOT NULL,
     airline TEXT NOT NULL,
@@ -59,21 +65,23 @@ CREATE TABLE IF NOT EXISTS observations (
     extra_json TEXT,
     observed_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_obs_date_ver ON observations(travel_date, verification, price);
+CREATE INDEX IF NOT EXISTS idx_obs_route ON observations(origin, destination, travel_date, verification, price);
 CREATE INDEX IF NOT EXISTS idx_obs_run ON observations(run_id);
 CREATE INDEX IF NOT EXISTS idx_obs_flight ON observations(flight_key, observed_at);
 CREATE TABLE IF NOT EXISTS record_lows (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    origin TEXT NOT NULL,
+    destination TEXT NOT NULL,
     travel_date TEXT NOT NULL,
     observation_id INTEGER NOT NULL REFERENCES observations(id),
     price REAL NOT NULL,
     previous_low REAL,
-    min_verification INTEGER NOT NULL,
     recorded_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     dedup_key TEXT NOT NULL UNIQUE,
+    watch_id TEXT,
     kind TEXT NOT NULL,
     travel_date TEXT,
     flight_key TEXT,
@@ -81,10 +89,18 @@ CREATE TABLE IF NOT EXISTS alerts (
     price REAL,
     previous_low REAL,
     channels TEXT,
-    delivered INTEGER NOT NULL DEFAULT 0,
     sent_at TEXT NOT NULL,
-    subject TEXT,
-    body TEXT
+    subject TEXT
+);
+CREATE TABLE IF NOT EXISTS watches (
+    id TEXT PRIMARY KEY,
+    title TEXT, url TEXT, origin TEXT, destination TEXT, dates_json TEXT, days_json TEXT,
+    frequency TEXT, target REAL, max_stops INTEGER, active INTEGER NOT NULL DEFAULT 1,
+    body_hash TEXT, created_at TEXT, updated_at TEXT, last_checked TEXT, status_comment_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS api_usage (
+    month TEXT NOT NULL, provider TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (month, provider)
 );
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
 """
@@ -113,23 +129,26 @@ class Database:
         self.conn.commit()
         self.conn.close()
 
+    def commit(self):
+        self.conn.commit()
+
     # ---- runs & searches -------------------------------------------------------------------------
-    def start_run(self, now: datetime | None = None) -> int:
-        cur = self.conn.execute("INSERT INTO runs(started_at) VALUES (?)", (iso(now or utcnow()),))
+    def start_run(self, now: datetime, trigger: str = "") -> int:
+        cur = self.conn.execute("INSERT INTO runs(started_at, trigger) VALUES (?,?)", (iso(now), trigger))
         self.conn.commit()
         return cur.lastrowid
 
-    def finish_run(self, run_id: int, status: str, notes: str = "", now: datetime | None = None):
+    def finish_run(self, run_id: int, status: str, notes: str, now: datetime):
         self.conn.execute("UPDATE runs SET finished_at=?, status=?, notes=? WHERE id=?",
-                          (iso(now or utcnow()), status, notes, run_id))
+                          (iso(now), status, notes, run_id))
         self.conn.commit()
 
-    def record_search(self, run_id, provider, travel_date, status, error=None, result_count=0,
-                      kept_count=0, meta=None, now: datetime | None = None) -> int:
+    def record_search(self, run_id, provider, origin, destination, travel_date, status, now, error=None,
+                      result_count=0, meta=None) -> int:
         cur = self.conn.execute(
-            "INSERT INTO searches(run_id, provider, travel_date, started_at, status, error, result_count, "
-            "kept_count, meta_json) VALUES (?,?,?,?,?,?,?,?,?)",
-            (run_id, provider, travel_date, iso(now or utcnow()), status, error, result_count, kept_count,
+            "INSERT INTO searches(run_id, provider, origin, destination, travel_date, started_at, status, error, "
+            "result_count, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (run_id, provider, origin, destination, travel_date, iso(now), status, error, result_count,
              json.dumps(meta, default=str) if meta else None))
         self.conn.commit()
         return cur.lastrowid
@@ -140,14 +159,15 @@ class Database:
     # ---- observations ----------------------------------------------------------------------------
     def insert_observation(self, run_id: int, search_id: int, opt: FareOption, value_score: float | None) -> int:
         cur = self.conn.execute(
-            """INSERT INTO observations(run_id, search_id, provider, source, travel_date, flight_key, airline,
-               flight_numbers, departure_local, arrival_local, duration_minutes, stops, layovers_json, price,
-               currency, verification, verification_note, seller, cabin_baggage, checked_baggage, booking_url,
-               booking_request_json, offer_ref, expires_at, value_score, search_price, extra_json, observed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (run_id, search_id, opt.provider, opt.source, opt.travel_date, opt.flight_key, opt.airline,
-             json.dumps(opt.flight_numbers), opt.departure_local, opt.arrival_local, opt.duration_minutes,
-             opt.stops, opt.layovers_json(), opt.price, opt.currency, int(opt.verification),
+            """INSERT INTO observations(run_id, search_id, provider, source, origin, destination, travel_date,
+               flight_key, airline, flight_numbers, departure_local, arrival_local, duration_minutes, stops,
+               layovers_json, price, currency, verification, verification_note, seller, cabin_baggage,
+               checked_baggage, booking_url, booking_request_json, offer_ref, expires_at, value_score,
+               search_price, extra_json, observed_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (run_id, search_id, opt.provider, opt.source, opt.origin, opt.destination, opt.travel_date,
+             opt.flight_key, opt.airline, json.dumps(opt.flight_numbers), opt.departure_local, opt.arrival_local,
+             opt.duration_minutes, opt.stops, opt.layovers_json(), opt.price, opt.currency, int(opt.verification),
              opt.verification_note, opt.seller, opt.cabin_baggage, opt.checked_baggage, opt.booking_url,
              json.dumps(opt.booking_request) if opt.booking_request else None, opt.offer_ref[:512],
              opt.expires_at, value_score, opt.extra.get("search_price"),
@@ -155,28 +175,22 @@ class Database:
              opt.observed_at))
         return cur.lastrowid
 
-    def commit(self):
-        self.conn.commit()
-
-    def previous_low(self, travel_date: str, min_verification: int, before_run_id: int) -> sqlite3.Row | None:
+    def previous_low(self, origin, destination, travel_date, min_ver, max_stops, before_run_id):
         return self.conn.execute(
-            """SELECT * FROM observations WHERE travel_date=? AND verification>=? AND run_id<?
-               ORDER BY price ASC, observed_at ASC LIMIT 1""",
-            (travel_date, min_verification, before_run_id)).fetchone()
+            """SELECT * FROM observations WHERE origin=? AND destination=? AND travel_date=? AND verification>=?
+               AND stops<=? AND run_id<? ORDER BY price ASC, observed_at ASC LIMIT 1""",
+            (origin, destination, travel_date, min_ver, max_stops, before_run_id)).fetchone()
 
-    def run_best(self, run_id: int, travel_date: str, min_verification: int) -> sqlite3.Row | None:
+    def run_observations(self, run_id, origin, destination, travel_date, min_ver=1, max_stops=9):
         return self.conn.execute(
-            """SELECT * FROM observations WHERE run_id=? AND travel_date=? AND verification>=?
-               ORDER BY price ASC, verification DESC, duration_minutes ASC LIMIT 1""",
-            (run_id, travel_date, min_verification)).fetchone()
+            """SELECT * FROM observations WHERE run_id=? AND origin=? AND destination=? AND travel_date=?
+               AND verification>=? AND stops<=? ORDER BY price ASC, verification DESC, duration_minutes ASC""",
+            (run_id, origin, destination, travel_date, min_ver, max_stops)).fetchall()
 
-    def run_observations(self, run_id: int, travel_date: str | None = None, min_verification: int = 1):
-        sql = "SELECT * FROM observations WHERE run_id=? AND verification>=?"
-        args: list = [run_id, min_verification]
-        if travel_date:
-            sql += " AND travel_date=?"
-            args.append(travel_date)
-        return self.conn.execute(sql + " ORDER BY price ASC, verification DESC", args).fetchall()
+    def recent_confirmation(self, flight_key: str, min_ver: int, since: datetime):
+        return self.conn.execute(
+            """SELECT * FROM observations WHERE flight_key=? AND verification>=? AND observed_at>=?
+               ORDER BY observed_at DESC LIMIT 1""", (flight_key, min_ver, iso(since))).fetchone()
 
     def flight_last_seen_before(self, flight_key: str, before_run_id: int) -> str | None:
         row = self.conn.execute(
@@ -184,111 +198,130 @@ class Database:
             "WHERE o.flight_key=? AND o.run_id<?", (flight_key, before_run_id)).fetchone()
         return row["t"] if row else None
 
-    def date_had_successful_search_before(self, travel_date: str, before_run_id: int) -> bool:
-        row = self.conn.execute(
-            "SELECT 1 FROM searches WHERE travel_date=? AND status IN ('ok','empty') AND run_id<? LIMIT 1",
-            (travel_date, before_run_id)).fetchone()
-        return row is not None
+    def route_had_search_before(self, origin, destination, travel_date, before_run_id) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM searches WHERE origin=? AND destination=? AND travel_date=? AND status IN ('ok','empty')"
+            " AND run_id<? LIMIT 1", (origin, destination, travel_date, before_run_id)).fetchone() is not None
 
-    def hourly_lows(self, travel_date: str, min_verification: int, since: datetime | None = None):
-        """Lowest eligible fare per run for a date: the historical trend."""
-        sql = """SELECT r.id AS run_id, r.started_at, MIN(o.price) AS price
-                 FROM observations o JOIN runs r ON r.id=o.run_id
-                 WHERE o.travel_date=? AND o.verification>=?"""
-        args: list = [travel_date, min_verification]
-        if since:
-            sql += " AND r.started_at>=?"
-            args.append(iso(since))
-        return self.conn.execute(sql + " GROUP BY r.id ORDER BY r.started_at", args).fetchall()
+    def lows_per_run(self, origin, destination, travel_date, min_ver=1, max_stops=9):
+        """Lowest fare per check for a route/date: the historical trend."""
+        return self.conn.execute(
+            """SELECT r.id AS run_id, r.started_at, MIN(o.price) AS price, MAX(o.verification) AS verification
+               FROM observations o JOIN runs r ON r.id=o.run_id
+               WHERE o.origin=? AND o.destination=? AND o.travel_date=? AND o.verification>=? AND o.stops<=?
+               GROUP BY r.id ORDER BY r.started_at""",
+            (origin, destination, travel_date, min_ver, max_stops)).fetchall()
 
-    def add_record_low(self, travel_date, observation_id, price, previous_low, min_verification, now=None):
+    def add_record_low(self, origin, destination, travel_date, observation_id, price, previous_low, now):
         self.conn.execute(
-            "INSERT INTO record_lows(travel_date, observation_id, price, previous_low, min_verification, recorded_at)"
-            " VALUES (?,?,?,?,?,?)", (travel_date, observation_id, price, previous_low, min_verification,
-                                      iso(now or utcnow())))
+            "INSERT INTO record_lows(origin, destination, travel_date, observation_id, price, previous_low, "
+            "recorded_at) VALUES (?,?,?,?,?,?,?)",
+            (origin, destination, travel_date, observation_id, price, previous_low, iso(now)))
         self.conn.commit()
 
-    def record_lows(self, travel_date: str | None = None):
-        sql = ("SELECT rl.*, o.airline, o.flight_numbers, o.provider, o.verification FROM record_lows rl "
-               "JOIN observations o ON o.id=rl.observation_id")
-        args = []
-        if travel_date:
-            sql += " WHERE rl.travel_date=?"
-            args.append(travel_date)
-        return self.conn.execute(sql + " ORDER BY rl.recorded_at", args).fetchall()
+    def all_time_low(self, origin, destination, travel_date, min_ver, max_stops=9):
+        return self.conn.execute(
+            """SELECT * FROM observations WHERE origin=? AND destination=? AND travel_date=? AND verification>=?
+               AND stops<=? ORDER BY price ASC, observed_at ASC LIMIT 1""",
+            (origin, destination, travel_date, min_ver, max_stops)).fetchone()
+
+    def latest_route_search(self, origin, destination, travel_date):
+        """Most recent successful search for a route/date and its observations."""
+        s = self.conn.execute(
+            """SELECT * FROM searches WHERE origin=? AND destination=? AND travel_date=? AND status IN ('ok','empty')
+               ORDER BY id DESC LIMIT 1""", (origin, destination, travel_date)).fetchone()
+        if not s:
+            return None, []
+        rows = self.conn.execute(
+            "SELECT * FROM observations WHERE run_id=? AND origin=? AND destination=? AND travel_date=? "
+            "ORDER BY price ASC, verification DESC", (s["run_id"], origin, destination, travel_date)).fetchall()
+        return s, rows
+
+    def airline_comparison(self, origin, destination, dates: list[str], min_ver: int):
+        q = ",".join("?" * len(dates))
+        return self.conn.execute(
+            f"""SELECT airline, travel_date, MIN(price) AS min_price, COUNT(*) AS n FROM observations
+                WHERE origin=? AND destination=? AND travel_date IN ({q}) AND verification>=?
+                GROUP BY airline, travel_date ORDER BY min_price""",
+            (origin, destination, *dates, min_ver)).fetchall()
 
     # ---- alerts ----------------------------------------------------------------------------------
     def alert_exists(self, dedup_key: str) -> bool:
         return self.conn.execute("SELECT 1 FROM alerts WHERE dedup_key=?", (dedup_key,)).fetchone() is not None
 
-    def save_alert(self, dedup_key, kind, travel_date, flight_key, observation_id, price, previous_low,
-                   channels, delivered, subject, body, now=None):
+    def save_alert(self, dedup_key, watch_id, kind, travel_date, flight_key, observation_id, price, previous_low,
+                   channels, subject, now):
         self.conn.execute(
-            """INSERT OR IGNORE INTO alerts(dedup_key, kind, travel_date, flight_key, observation_id, price,
-               previous_low, channels, delivered, sent_at, subject, body) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (dedup_key, kind, travel_date, flight_key, observation_id, price, previous_low, channels,
-             int(delivered), iso(now or utcnow()), subject, body))
+            """INSERT OR IGNORE INTO alerts(dedup_key, watch_id, kind, travel_date, flight_key, observation_id,
+               price, previous_low, channels, sent_at, subject) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (dedup_key, watch_id, kind, travel_date, flight_key, observation_id, price, previous_low, channels,
+             iso(now), subject))
         self.conn.commit()
 
-    def recent_alerts(self, limit: int = 20):
+    def recent_alerts(self, limit: int = 20, watch_id: str | None = None):
+        if watch_id:
+            return self.conn.execute("SELECT * FROM alerts WHERE watch_id=? ORDER BY sent_at DESC, id DESC LIMIT ?",
+                                     (watch_id, limit)).fetchall()
         return self.conn.execute("SELECT * FROM alerts ORDER BY sent_at DESC, id DESC LIMIT ?", (limit,)).fetchall()
 
-    # ---- status for reports ----------------------------------------------------------------------
-    def last_run(self, statuses=("ok", "partial")) -> sqlite3.Row | None:
+    # ---- watches ---------------------------------------------------------------------------------
+    def get_watch(self, watch_id: str):
+        return self.conn.execute("SELECT * FROM watches WHERE id=?", (watch_id,)).fetchone()
+
+    def upsert_watch(self, w, now: datetime):
+        existing = self.get_watch(w.id)
+        vals = (w.title, w.url, w.origin, w.destination, json.dumps([d.isoformat() for d in w.dates]),
+                json.dumps(w.days), w.frequency, w.target, w.max_stops, w.body_hash, iso(now))
+        if existing:
+            self.conn.execute(
+                """UPDATE watches SET title=?, url=?, origin=?, destination=?, dates_json=?, days_json=?, frequency=?,
+                   target=?, max_stops=?, body_hash=?, updated_at=?, active=1 WHERE id=?""", (*vals, w.id))
+        else:
+            self.conn.execute(
+                """INSERT INTO watches(title, url, origin, destination, dates_json, days_json, frequency, target,
+                   max_stops, body_hash, updated_at, created_at, id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (*vals, iso(now), w.id))
+        self.conn.commit()
+
+    def set_watch_field(self, watch_id: str, field: str, value):
+        assert field in ("active", "last_checked", "status_comment_id")
+        self.conn.execute(f"UPDATE watches SET {field}=? WHERE id=?", (value, watch_id))
+        self.conn.commit()
+
+    def watches(self, active_only: bool = False):
+        sql = "SELECT * FROM watches" + (" WHERE active=1" if active_only else "") + " ORDER BY CAST(id AS INTEGER)"
+        return self.conn.execute(sql).fetchall()
+
+    # ---- search budget ---------------------------------------------------------------------------
+    def add_usage(self, month: str, provider: str, calls: int):
+        if calls:
+            self.conn.execute(
+                "INSERT INTO api_usage(month, provider, calls) VALUES (?,?,?) "
+                "ON CONFLICT(month, provider) DO UPDATE SET calls=calls+excluded.calls", (month, provider, calls))
+            self.conn.commit()
+
+    def usage(self, month: str, provider: str) -> int:
+        row = self.conn.execute("SELECT calls FROM api_usage WHERE month=? AND provider=?",
+                                (month, provider)).fetchone()
+        return row["calls"] if row else 0
+
+    # ---- status ----------------------------------------------------------------------------------
+    def last_run(self, statuses=("ok", "partial")):
         q = ",".join("?" * len(statuses))
         return self.conn.execute(f"SELECT * FROM runs WHERE status IN ({q}) ORDER BY id DESC LIMIT 1",
                                  statuses).fetchone()
 
-    def recent_runs(self, limit: int = 50):
-        return self.conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-
     def provider_status(self):
-        """Last search and last successful search for each (provider, date)."""
         return self.conn.execute(
-            """SELECT s.provider, s.travel_date, s.status, s.error, s.started_at, s.result_count, s.kept_count,
-                      (SELECT MAX(started_at) FROM searches s2 WHERE s2.provider=s.provider
-                         AND s2.travel_date=s.travel_date AND s2.status IN ('ok','empty')) AS last_success
+            """SELECT s.provider, s.origin, s.destination, s.travel_date, s.status, s.error, s.started_at,
+                      s.result_count, s.kept_count,
+                      (SELECT MAX(started_at) FROM searches s2 WHERE s2.provider=s.provider AND s2.origin=s.origin
+                         AND s2.destination=s.destination AND s2.travel_date=s.travel_date
+                         AND s2.status IN ('ok','empty')) AS last_success
                FROM searches s
-               WHERE s.id IN (SELECT MAX(id) FROM searches GROUP BY provider, travel_date)
-               ORDER BY s.provider, s.travel_date""").fetchall()
+               WHERE s.id IN (SELECT MAX(id) FROM searches GROUP BY provider, origin, destination, travel_date)
+               ORDER BY s.travel_date, s.provider""").fetchall()
 
-    def latest_search_meta(self, provider: str, travel_date: str):
-        row = self.conn.execute(
-            "SELECT meta_json, started_at FROM searches WHERE provider=? AND travel_date=? AND status='ok' "
-            "ORDER BY id DESC LIMIT 1", (provider, travel_date)).fetchone()
-        return (json.loads(row["meta_json"]) if row and row["meta_json"] else None), (row["started_at"] if row else None)
-
-    def latest_observations(self, travel_date: str, stale_after_minutes: int, now: datetime | None = None):
-        """Observations from the most recent run that searched this date successfully, if still fresh."""
-        now = now or utcnow()
-        row = self.conn.execute(
-            "SELECT MAX(run_id) AS run_id FROM searches WHERE travel_date=? AND status IN ('ok','empty')",
-            (travel_date,)).fetchone()
-        if not row or row["run_id"] is None:
-            return [], None, True
-        rows = self.conn.execute(
-            "SELECT * FROM observations WHERE run_id=? AND travel_date=? ORDER BY price ASC, verification DESC",
-            (row["run_id"], travel_date)).fetchall()
-        run = self.conn.execute("SELECT * FROM runs WHERE id=?", (row["run_id"],)).fetchone()
-        started = datetime.fromisoformat(run["started_at"])
-        stale = now - started > timedelta(minutes=stale_after_minutes)
-        return rows, run, stale
-
-    def all_time_low(self, travel_date: str, min_verification: int):
-        return self.conn.execute(
-            "SELECT * FROM observations WHERE travel_date=? AND verification>=? ORDER BY price ASC, observed_at ASC "
-            "LIMIT 1", (travel_date, min_verification)).fetchone()
-
-    def airline_comparison(self, min_verification: int, since: datetime | None = None):
-        sql = """SELECT airline, travel_date, MIN(price) AS min_price, COUNT(*) AS n, MAX(observed_at) AS last_seen
-                 FROM observations WHERE verification>=?"""
-        args: list = [min_verification]
-        if since:
-            sql += " AND observed_at>=?"
-            args.append(iso(since))
-        return self.conn.execute(sql + " GROUP BY airline, travel_date ORDER BY min_price", args).fetchall()
-
-    # ---- key/value state -------------------------------------------------------------------------
     def kv_get(self, key: str, default=None):
         row = self.conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
         return row["value"] if row else default

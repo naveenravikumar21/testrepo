@@ -28,18 +28,20 @@ class ProviderError(Exception):
 class Provider(ABC):
     name: str = "base"
     display_name: str = "Base"
+    counts_against_budget: bool = False   # True when each API call uses a metered search
 
     def __init__(self, config: Config, session):
         self.config = config
         self.session = session
         self.settings = config.provider_settings.get(self.name, {})
+        self.calls = 0                    # API calls made by this instance (for the search budget)
 
     @classmethod
     def is_configured(cls, config: Config) -> bool:  # pragma: no cover - overridden
         return False
 
     @abstractmethod
-    def search(self, travel_date: date) -> tuple[list[FareOption], dict]:
+    def search(self, origin: str, destination: str, travel_date: date, max_stops: int) -> tuple[list[FareOption], dict]:
         """Return (options, metadata). Raise ProviderError on failure."""
 
     def verify(self, option: FareOption) -> FareOption | None:
@@ -49,6 +51,10 @@ class Provider(ABC):
     @property
     def verify_budget(self) -> int:
         return 0
+
+    def remaining_quota(self) -> dict | None:
+        """Provider-reported usage, e.g. {"used": 12, "left": 238}. None if unknown."""
+        return None
 
 
 def google_flights_search_url(origin: str, destination: str, travel_date: date) -> str:

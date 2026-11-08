@@ -1,27 +1,30 @@
-name: Fare monitor (JAI → COK)
+name: Fare monitor
 
 on:
   schedule:
-    - cron: "17 * * * *"          # hourly, at :17 to avoid the top-of-hour scheduler backlog
+    - cron: "35 1 * * *"          # every day 01:35 UTC = 07:05 IST; each watch decides if today is a check day
+  issues:
+    types: [opened, edited, reopened]   # new or changed "Fare watch" issues are checked right away
   workflow_dispatch:
     inputs:
-      command:
+      mode:
         description: "What to do"
         type: choice
-        options: [run, test-notify, send-summary]
-        default: run
-      dry_run:
-        description: "Dry run: print notifications to the log only and do NOT save state"
-        type: boolean
-        default: false
+        options:
+          - check watches that are due
+          - check all watches now
+          - dry run (no posting, no saving)
+        default: check watches that are due
 
 permissions:
-  contents: write                 # push the state snapshot to the fare-data branch
-  actions: write                  # disable this workflow once the travel dates have passed
+  contents: write                 # save the database snapshot to the fare-data branch
+  issues: write                   # post alerts/status on watch issues (GitHub emails you)
+  pages: write                    # publish the dashboard
+  id-token: write
 
 concurrency:
   group: fare-monitor
-  cancel-in-progress: false       # never run two cycles against the same database at once
+  cancel-in-progress: false       # never run two checks against the same database at once
 
 env:
   STATE_BRANCH: fare-data
@@ -30,10 +33,18 @@ env:
 
 jobs:
   monitor:
-    # Manual stop: set the repository variable MONITOR_ENABLED=false (or disable this workflow).
-    if: vars.MONITOR_ENABLED != 'false'
+    # Issue events: only "Fare watch" issues opened by the owner/collaborators (strangers can open issues
+    # on a public repository; they must not be able to spend your searches).
+    if: >-
+      vars.MONITOR_ENABLED != 'false' && (
+        github.event_name != 'issues' || (
+          (startsWith(github.event.issue.title, '[Fare watch]') ||
+           contains(github.event.issue.labels.*.name, 'fare-watch')) &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)))
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment:
+      name: github-pages
     steps:
       - uses: actions/checkout@v4
 
@@ -45,7 +56,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Restore state (SQLite database) from the fare-data branch
+      - name: Restore database from the fare-data branch
         id: restore
         run: |
           set -euo pipefail
@@ -60,44 +71,42 @@ jobs:
           elif [ "$rc" -eq 2 ]; then
             echo "No state branch yet: starting a fresh database"
           else
-            echo "::error::Could not query the state branch (git exit $rc); refusing to run without history"
+            echo "::error::Could not read the state branch (git exit $rc); refusing to run without history"
             exit 1
           fi
 
-      - name: Run monitoring cycle
+      - name: Check fares
         id: run
         env:
-          DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_ACCESS_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_ACCESS_TOKEN }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          SMTP_USE_SSL: ${{ vars.SMTP_USE_SSL }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           NOTIFY_CHANNELS: ${{ vars.NOTIFY_CHANNELS }}
           PROVIDERS: ${{ vars.PROVIDERS }}
           ALERT_MIN_STATUS: ${{ vars.ALERT_MIN_STATUS }}
-          TARGET_FARE_INR: ${{ vars.TARGET_FARE_INR }}
-          DAILY_SUMMARY_HOUR: ${{ vars.DAILY_SUMMARY_HOUR }}
-          DASHBOARD_URL: ${{ vars.DASHBOARD_URL }}
-          MONITOR_ENABLED: ${{ vars.MONITOR_ENABLED }}
-          COMMAND: ${{ inputs.command || 'run' }}
-          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          SERPAPI_MONTHLY_LIMIT: ${{ vars.SERPAPI_MONTHLY_LIMIT }}
+          DASHBOARD_URL: ${{ vars.DASHBOARD_URL || format('https://{0}.github.io/{1}/', github.repository_owner, github.event.repository.name) }}
+          MODE: ${{ inputs.mode }}
+          EVENT: ${{ github.event_name }}
+          ISSUE: ${{ github.event.issue.number }}
         run: |
-          case "$COMMAND" in
-            test-notify)  python -m fare_monitor test-notify ;;
-            send-summary) python -m fare_monitor summary --send ;;
-            *)            if [ "$DRY_RUN" = "true" ]; then python -m fare_monitor run --dry-run
-                          else python -m fare_monitor run; fi ;;
+          args=(run --trigger "$EVENT")
+          [ "$EVENT" = "issues" ] && args+=(--issue "$ISSUE")
+          case "$MODE" in
+            "check all watches now") args+=(--check-now) ;;
+            "dry run"*)              args+=(--dry-run) ;;
           esac
+          python -m fare_monitor "${args[@]}"
 
-      - name: Save state snapshot to the fare-data branch
-        # Runs even when the cycle failed, so failure counters and partial results are kept.
-        if: always() && steps.restore.outcome == 'success' && !inputs.dry_run && inputs.command != 'test-notify'
+      - name: Save database snapshot to the fare-data branch
+        # Runs even when the check failed, so failure counters and partial results are kept.
+        if: always() && steps.restore.outcome == 'success' && !startsWith(inputs.mode, 'dry run')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -109,8 +118,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -q -m "Fare monitor state $(date -u +%Y-%m-%dT%H:%MZ) (run ${GITHUB_RUN_ID})"
-          # A single-commit snapshot is force-pushed: the full price history lives inside the database,
-          # so the repository does not grow by one database copy per hour.
+          # One snapshot commit, force-pushed: the full history lives inside the database.
           git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             "HEAD:refs/heads/${STATE_BRANCH}"
 
@@ -123,8 +131,22 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
-      - name: Stop monitoring after the travel dates have passed
-        if: steps.run.outputs.window_closed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow disable monitor.yml --repo "$GITHUB_REPOSITORY"
+      - name: Prepare dashboard
+        id: site
+        if: always() && steps.restore.outcome == 'success' && !startsWith(inputs.mode, 'dry run')
+        run: |
+          mkdir -p site
+          if [ -f state/index.html ]; then cp state/index.html site/index.html; fi
+          test -f site/index.html
+
+      - name: Upload dashboard
+        if: always() && steps.site.outcome == 'success'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Publish dashboard (GitHub Pages)
+        # Needs Settings -> Pages -> Source: "GitHub Actions" (one-time). Never fails the check itself.
+        if: always() && steps.site.outcome == 'success'
+        continue-on-error: true
+        uses: actions/deploy-pages@v4

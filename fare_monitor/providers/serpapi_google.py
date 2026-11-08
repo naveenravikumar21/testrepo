@@ -36,6 +36,7 @@ def _iso_local(value: str) -> str:
 class SerpApiGoogleFlightsProvider(Provider):
     name = "serpapi_google_flights"
     display_name = "Google Flights (via SerpApi)"
+    counts_against_budget = True
 
     @classmethod
     def is_configured(cls, config) -> bool:
@@ -43,25 +44,44 @@ class SerpApiGoogleFlightsProvider(Provider):
 
     @property
     def verify_budget(self) -> int:
-        return int(self.settings.get("booking_checks_per_date", 2))
+        return int(self.settings.get("booking_checks_per_date", 1))
 
-    def _base_params(self, travel_date: date) -> dict:
-        trip = self.config.trip
+    def remaining_quota(self) -> dict | None:
+        """SerpApi Account API (free, does not use a search)."""
+        try:
+            resp = self.session.get("https://serpapi.com/account.json",
+                                    params={"api_key": self.config.secrets.serpapi_api_key}, timeout=30)
+            data = resp.json()
+        except Exception as exc:
+            log.warning("SerpApi account lookup failed: %s", exc)
+            return None
+        if resp.status_code >= 400 or "error" in data:
+            log.warning("SerpApi account lookup failed: %s", data.get("error") or resp.status_code)
+            return None
+        used = data.get("this_month_usage")
+        left = data.get("total_searches_left", data.get("plan_searches_left"))
+        if used is None and left is None:
+            return None
+        return {"used": used, "left": left, "per_month": data.get("searches_per_month"),
+                "plan": data.get("plan_name")}
+
+    def _base_params(self, origin: str, destination: str, travel_date: date, max_stops: int) -> dict:
+        d = self.config.defaults
         params = {
             "engine": "google_flights",
-            "departure_id": trip.origin,
-            "arrival_id": trip.destination,
+            "departure_id": origin,
+            "arrival_id": destination,
             "outbound_date": travel_date.isoformat(),
             "type": 2,                    # one-way
             "travel_class": 1,            # economy
-            "adults": trip.adults,
-            "currency": trip.currency,
+            "adults": d.adults,
+            "currency": d.currency,
             "gl": "in",
             "hl": "en",
             "no_cache": "true",           # always a fresh search: no stale cached prices
             "api_key": self.config.secrets.serpapi_api_key,
         }
-        stops = STOPS_PARAM.get(self.config.preferences.max_stops)
+        stops = STOPS_PARAM.get(max_stops)
         if stops:
             params["stops"] = stops
         if self.settings.get("deep_search", True):
@@ -69,6 +89,7 @@ class SerpApiGoogleFlightsProvider(Provider):
         return params
 
     def _get(self, params: dict, what: str) -> dict:
+        self.calls += 1
         try:
             resp = self.session.get(API, params=params, timeout=90)
         except Exception as exc:
@@ -87,24 +108,24 @@ class SerpApiGoogleFlightsProvider(Provider):
             raise ProviderError(f"SerpApi {what}: search status {status}")
         return payload
 
-    def search(self, travel_date: date):
-        payload = self._get(self._base_params(travel_date), "search")
+    def search(self, origin: str, destination: str, travel_date: date, max_stops: int = 2):
+        payload = self._get(self._base_params(origin, destination, travel_date, max_stops), "search")
         meta = {"price_insights": payload.get("price_insights"),
                 "google_flights_url": (payload.get("search_metadata") or {}).get("google_flights_url")}
         if payload.get("_no_results"):
             return [], meta
-        search_url = meta["google_flights_url"] or google_flights_search_url(
-            self.config.trip.origin, self.config.trip.destination, travel_date)
+        search_url = meta["google_flights_url"] or google_flights_search_url(origin, destination, travel_date)
         observed_at = _utcnow_iso()
         options = []
         for group in ("best_flights", "other_flights"):
             for item in payload.get(group) or []:
-                opt = self._parse_itinerary(item, travel_date, observed_at, search_url)
+                opt = self._parse_itinerary(item, origin, destination, travel_date, observed_at, search_url)
                 if opt:
                     options.append(opt)
         return options, meta
 
-    def _parse_itinerary(self, item: dict, travel_date: date, observed_at: str, search_url: str):
+    def _parse_itinerary(self, item: dict, origin: str, destination: str, travel_date: date, observed_at: str,
+                         search_url: str):
         legs = item.get("flights") or []
         price = item.get("price")
         if not legs or not isinstance(price, (int, float)):
@@ -122,6 +143,8 @@ class SerpApiGoogleFlightsProvider(Provider):
             return FareOption(
                 provider=self.name,
                 source=self.display_name,
+                origin=origin,
+                destination=destination,
                 travel_date=travel_date.isoformat(),
                 airline=" + ".join(airlines),
                 flight_numbers=[leg.get("flight_number", "?") for leg in legs],
@@ -131,7 +154,7 @@ class SerpApiGoogleFlightsProvider(Provider):
                 stops=len(legs) - 1,
                 layovers=layovers,
                 price=float(price),
-                currency=self.config.trip.currency,
+                currency=self.config.defaults.currency,
                 verification=Verification.INDICATIVE,
                 verification_note="Google Flights search price (not yet confirmed by a seller)",
                 observed_at=observed_at,
@@ -150,7 +173,8 @@ class SerpApiGoogleFlightsProvider(Provider):
     def verify(self, option: FareOption) -> FareOption | None:
         if not option.offer_ref:
             return option
-        params = self._base_params(date.fromisoformat(option.travel_date))
+        params = self._base_params(option.origin, option.destination, date.fromisoformat(option.travel_date),
+                                   self.config.defaults.max_stops)
         params["booking_token"] = option.offer_ref
         try:
             payload = self._get(params, "booking options")

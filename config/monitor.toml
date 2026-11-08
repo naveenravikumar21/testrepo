@@ -1,64 +1,82 @@
-# Jaipur -> Kochi fare monitor: non-secret settings.
-# Secrets (API keys, bot tokens, SMTP passwords) are NEVER stored here; they come from
-# environment variables / GitHub Actions secrets. Most keys below can also be overridden
-# with an environment variable (listed next to the key).
+# Flight fare monitor: non-secret settings.
+#
+# What to watch (route, dates, how often, book-now price) is NOT set here: each trip is a
+# "Fare watch" issue created from the form in GitHub (Issues -> New issue -> Fare watch).
+# This file only holds defaults and safety limits. Secrets (API keys) come from GitHub
+# Actions secrets / environment variables and are never stored here.
 
-[trip]
-origin = "JAI"                      # Jaipur International Airport
-destination = "COK"                 # Cochin International Airport
-dates = ["2027-01-04", "2027-01-05"]
+[defaults]
+origin = "JAI"                      # used when a watch leaves "From" empty
+destination = "COK"                 # used when a watch leaves "To" empty
 adults = 1
 cabin = "economy"
 currency = "INR"
 timezone = "Asia/Kolkata"
+target_fare_inr = 0                 # book-now price when a watch leaves it empty (0 = none)
+max_stops = 2                       # most stops any search will include
+
+[local]
+# Only for running on your own computer without GitHub: dates to check (or set TRAVEL_DATES).
+dates = []
+target_fare_inr = 0
 
 [preferences]
-# Hard filters. Options outside these limits are not recorded.
-max_stops = 2                       # PREF_MAX_STOPS
-max_duration_hours = 18             # PREF_MAX_DURATION_HOURS
-earliest_departure = "00:00"        # local time at JAI
+# Options outside these limits are discarded (applies to every watch).
+max_duration_hours = 18
+earliest_departure = "00:00"        # local time at the departure airport
 latest_departure = "23:59"
 min_layover_minutes = 45            # shorter connections are too risky
 max_layover_minutes = 600
-# "Best value" ranking = fare + value_inr_per_hour * journey hours + value_inr_per_stop * stops.
-# Used only to highlight a recommendation next to the cheapest fare. Alerts are always on price.
+# "Best value" = fare + value_inr_per_hour x journey hours + value_inr_per_stop x stops.
+# Shown on the dashboard as a recommendation; alerts are always about price.
 value_inr_per_hour = 300
 value_inr_per_stop = 750
-store_top_n = 20                    # options stored per (provider, date, run)
+store_top_n = 20                    # options stored per route/date/check
 
 [verification]
-# Minimum verification level a fare needs before it can set a record low or trigger an alert:
-#   verified       re-priced, live bookable offer from a booking API (Duffel)
-#   seller_quoted  final price quoted by a named seller (airline / OTA) via Google Flights booking options
-#   indicative     search-result price only; never alerts unless you lower this setting
+# A price must reach this level before it can be a record low or trigger an alert:
+#   verified       live bookable offer re-priced through a booking API (Duffel, optional)
+#   seller_quoted  final price quoted by a named seller (airline / OTA) via Google Flights
+#   indicative     search-result price only (never recommended for alerts)
 alert_min_status = "seller_quoted"  # ALERT_MIN_STATUS
-stale_after_minutes = 120           # older observations are shown as stale, never as "current"
+reverify_after_hours = 72           # re-confirm an unchanged under-target fare at most this often
 min_plausible_fare = 1000           # sanity bounds: anything outside is rejected as a data error
 max_plausible_fare = 150000
+stale_after_days = 8                # older prices are labelled stale on the dashboard
 
 [alerts]
-min_drop_inr = 200                  # a record low must beat the previous low by at least this...
-min_drop_pct = 2.0                  # ...and by at least this percentage, to be "meaningful"
-target_fare_inr = 0                 # TARGET_FARE_INR: alert at or below this fare (0 = disabled)
-attractive_below_median_pct = 15.0  # alert if fare is this % below the 7-day median of hourly lows
-attractive_min_history = 24         # ...once at least this many hourly lows exist for the date
-competitive_pct = 5.0               # new/returning flight alerts if within this % of the current low
-reappear_after_hours = 6            # a flight unseen for this long counts as "previously unavailable"
-send_baseline = true                # send one message with the first verified low per date
-daily_summary_hour = 8              # local hour (IST) after which the daily summary is sent
-health_alert_after_failures = 3     # consecutive fully-failed runs before an operations alert
+min_drop_inr = 200                  # a new record low must beat the previous low by at least this...
+min_drop_pct = 2.0                  # ...and by at least this percentage
+competitive_pct = 5.0               # "new flight" alerts only within this % of the current lowest
+reappear_after_days = 3             # a flight unseen this long counts as "previously unavailable"
+health_alert_after_failures = 2     # consecutive fully-failed checks before a problem notice
+
+[budget]
+# SerpApi free plan = 250 searches per month. Every Google Flights search for one date = 1 search;
+# confirming a seller's final price = 1 more search (only done when a fare might trigger an alert).
+monthly_search_limit = 250          # SERPAPI_MONTHLY_LIMIT
+safety_margin = 20                  # stop searching when fewer than this many searches are left
+max_dates_per_watch = 14
 
 [providers]
-enabled = ["duffel", "serpapi_google_flights"]   # PROVIDERS (comma separated)
+enabled = ["serpapi_google_flights"]   # add "duffel" if you have a live Duffel token
+
+[providers.serpapi_google_flights]
+deep_search = true                  # matches results shown in a browser more closely (slower)
+booking_checks_per_date = 1         # at most this many seller confirmations per date per check
 
 [providers.duffel]
 max_connections = 2
 supplier_timeout_ms = 20000
-verify_top_n = 3                    # cheapest offers per date re-priced with GET /air/offers/{id}
-
-[providers.serpapi_google_flights]
-deep_search = true                  # matches results shown in a browser more closely (slower)
-booking_checks_per_date = 2         # cheapest itineraries per date checked for seller quotes
+verify_top_n = 1
 
 [notify]
-channels = ["telegram"]             # NOTIFY_CHANNELS: telegram, email, console (comma separated)
+# github  = post on the watch's issue; GitHub emails you (and notifies the GitHub app)
+# email   = SMTP (needs SMTP_* secrets), telegram = Telegram bot, console = log only
+channels = ["github"]               # NOTIFY_CHANNELS
+
+[github]
+watch_title_prefix = "[Fare watch]"
+watch_label = "fare-watch"
+# Only issues opened by these people count as watches (strangers can open issues on public repos).
+allowed_author_associations = ["OWNER", "MEMBER", "COLLABORATOR"]

@@ -30,19 +30,19 @@ def _hhmm(value: str) -> time:
 
 
 @dataclass
-class Trip:
+class Defaults:
     origin: str
     destination: str
-    dates: list[date]
     adults: int
     cabin: str
     currency: str
     timezone: ZoneInfo
+    target_fare_inr: float
+    max_stops: int
 
 
 @dataclass
 class Preferences:
-    max_stops: int
     max_duration_minutes: int
     earliest_departure: time
     latest_departure: time
@@ -56,23 +56,39 @@ class Preferences:
 @dataclass
 class VerificationSettings:
     alert_min_status: Verification
-    stale_after_minutes: int
+    reverify_after_hours: int
     min_plausible_fare: float
     max_plausible_fare: float
+    stale_after_days: int
 
 
 @dataclass
 class AlertSettings:
     min_drop_inr: float
     min_drop_pct: float
-    target_fare_inr: float
-    attractive_below_median_pct: float
-    attractive_min_history: int
     competitive_pct: float
-    reappear_after_hours: int
-    send_baseline: bool
-    daily_summary_hour: int
+    reappear_after_days: int
     health_alert_after_failures: int
+
+
+@dataclass
+class BudgetSettings:
+    monthly_search_limit: int
+    safety_margin: int
+    max_dates_per_watch: int
+
+
+@dataclass
+class GitHubSettings:
+    token: str | None
+    repository: str | None
+    watch_title_prefix: str
+    watch_label: str
+    allowed_author_associations: list[str]
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token and self.repository)
 
 
 @dataclass
@@ -92,18 +108,26 @@ class Secrets:
 
 @dataclass
 class Config:
-    trip: Trip
+    defaults: Defaults
     preferences: Preferences
     verification: VerificationSettings
     alerts: AlertSettings
+    budget: BudgetSettings
+    github: GitHubSettings
     providers_enabled: list[str]
     provider_settings: dict
     notify_channels: list[str]
     secrets: Secrets
     db_path: Path
     report_dir: Path
+    local_dates: list[date] = field(default_factory=list)
+    local_target: float = 0
     monitor_enabled: bool = True
-    extra: dict = field(default_factory=dict)
+    dashboard_url: str = ""
+
+    @property
+    def tz(self) -> ZoneInfo:
+        return self.defaults.timezone
 
 
 def load_config(path: str | Path | None = None) -> Config:
@@ -111,22 +135,21 @@ def load_config(path: str | Path | None = None) -> Config:
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
 
-    t = raw["trip"]
-    dates_raw = _csv(_env("TRAVEL_DATES", t["dates"]))
-    trip = Trip(
-        origin=t["origin"].upper(),
-        destination=t["destination"].upper(),
-        dates=sorted(date.fromisoformat(d) for d in dates_raw),
-        adults=int(t.get("adults", 1)),
-        cabin=t.get("cabin", "economy"),
-        currency=t.get("currency", "INR").upper(),
-        timezone=ZoneInfo(t.get("timezone", "Asia/Kolkata")),
+    d = raw.get("defaults", {})
+    defaults = Defaults(
+        origin=d.get("origin", "JAI").upper(),
+        destination=d.get("destination", "COK").upper(),
+        adults=int(d.get("adults", 1)),
+        cabin=d.get("cabin", "economy"),
+        currency=d.get("currency", "INR").upper(),
+        timezone=ZoneInfo(d.get("timezone", "Asia/Kolkata")),
+        target_fare_inr=float(d.get("target_fare_inr", 0)),
+        max_stops=int(d.get("max_stops", 2)),
     )
 
     p = raw.get("preferences", {})
     prefs = Preferences(
-        max_stops=int(_env("PREF_MAX_STOPS", p.get("max_stops", 2))),
-        max_duration_minutes=int(float(_env("PREF_MAX_DURATION_HOURS", p.get("max_duration_hours", 18))) * 60),
+        max_duration_minutes=int(float(p.get("max_duration_hours", 18)) * 60),
         earliest_departure=_hhmm(p.get("earliest_departure", "00:00")),
         latest_departure=_hhmm(p.get("latest_departure", "23:59")),
         min_layover_minutes=int(p.get("min_layover_minutes", 45)),
@@ -139,23 +162,36 @@ def load_config(path: str | Path | None = None) -> Config:
     v = raw.get("verification", {})
     verification = VerificationSettings(
         alert_min_status=Verification.parse(_env("ALERT_MIN_STATUS", v.get("alert_min_status", "seller_quoted"))),
-        stale_after_minutes=int(v.get("stale_after_minutes", 120)),
+        reverify_after_hours=int(v.get("reverify_after_hours", 72)),
         min_plausible_fare=float(v.get("min_plausible_fare", 1000)),
         max_plausible_fare=float(v.get("max_plausible_fare", 150000)),
+        stale_after_days=int(v.get("stale_after_days", 8)),
     )
 
     a = raw.get("alerts", {})
     alerts = AlertSettings(
         min_drop_inr=float(a.get("min_drop_inr", 200)),
         min_drop_pct=float(a.get("min_drop_pct", 2.0)),
-        target_fare_inr=float(_env("TARGET_FARE_INR", a.get("target_fare_inr", 0))),
-        attractive_below_median_pct=float(a.get("attractive_below_median_pct", 15.0)),
-        attractive_min_history=int(a.get("attractive_min_history", 24)),
         competitive_pct=float(a.get("competitive_pct", 5.0)),
-        reappear_after_hours=int(a.get("reappear_after_hours", 6)),
-        send_baseline=bool(a.get("send_baseline", True)),
-        daily_summary_hour=int(_env("DAILY_SUMMARY_HOUR", a.get("daily_summary_hour", 8))),
-        health_alert_after_failures=int(a.get("health_alert_after_failures", 3)),
+        reappear_after_days=int(a.get("reappear_after_days", 3)),
+        health_alert_after_failures=int(a.get("health_alert_after_failures", 2)),
+    )
+
+    b = raw.get("budget", {})
+    budget = BudgetSettings(
+        monthly_search_limit=int(_env("SERPAPI_MONTHLY_LIMIT", b.get("monthly_search_limit", 250))),
+        safety_margin=int(b.get("safety_margin", 20)),
+        max_dates_per_watch=int(b.get("max_dates_per_watch", 14)),
+    )
+
+    g = raw.get("github", {})
+    github = GitHubSettings(
+        token=_env("GITHUB_TOKEN"),
+        repository=_env("GITHUB_REPOSITORY"),
+        watch_title_prefix=g.get("watch_title_prefix", "[Fare watch]"),
+        watch_label=g.get("watch_label", "fare-watch"),
+        allowed_author_associations=[s.upper() for s in g.get("allowed_author_associations",
+                                                                ["OWNER", "MEMBER", "COLLABORATOR"])],
     )
 
     providers_raw = raw.get("providers", {})
@@ -163,7 +199,7 @@ def load_config(path: str | Path | None = None) -> Config:
     provider_settings = {k: v for k, v in providers_raw.items() if isinstance(v, dict)}
 
     n = raw.get("notify", {})
-    channels = _csv(_env("NOTIFY_CHANNELS", n.get("channels", ["console"])))
+    channels = _csv(_env("NOTIFY_CHANNELS", n.get("channels", ["github"])))
 
     secrets = Secrets(
         duffel_access_token=_env("DUFFEL_ACCESS_TOKEN"),
@@ -179,18 +215,25 @@ def load_config(path: str | Path | None = None) -> Config:
         email_to=_csv(_env("EMAIL_TO", "")),
     )
 
+    local = raw.get("local", {})
+    local_dates = sorted(date.fromisoformat(x) for x in _csv(_env("TRAVEL_DATES", local.get("dates", []))))
+
     state_dir = Path(_env("FARE_STATE_DIR", "state"))
     return Config(
-        trip=trip,
+        defaults=defaults,
         preferences=prefs,
         verification=verification,
         alerts=alerts,
+        budget=budget,
+        github=github,
         providers_enabled=providers_enabled,
         provider_settings=provider_settings,
         notify_channels=channels,
         secrets=secrets,
         db_path=Path(_env("FARE_DB_PATH", state_dir / "fares.sqlite3")),
         report_dir=Path(_env("FARE_REPORT_DIR", state_dir)),
+        local_dates=local_dates,
+        local_target=float(_env("TARGET_FARE_INR", local.get("target_fare_inr", 0))),
         monitor_enabled=_env("MONITOR_ENABLED", "true").lower() not in ("0", "false", "no", "off"),
-        extra={"dashboard_url": _env("DASHBOARD_URL", "")},
+        dashboard_url=_env("DASHBOARD_URL", ""),
     )

@@ -2,37 +2,34 @@
 
 ## Goal
 
-Track the cheapest **one-way, economy, 1-adult** fare from **Jaipur (JAI)** to **Kochi (COK)** on
-**4 January 2027** and **5 January 2027**, every hour, until the dates pass or you stop it. Alert only on
+Track the cheapest **one-way, economy, 1-adult** fares for routes and dates you choose (first watch:
+**Jaipur (JAI) → Kochi (COK)**, 4 and 5 January 2027), on a schedule you set per watch. Alert only on
 fares that a seller or booking system actually confirmed, and only when something meaningfully changes.
 
 ## Components
 
 ```mermaid
 flowchart LR
-    subgraph GH[GitHub Actions: hourly cron + manual dispatch]
+    U[You: 'Fare watch' issue form] -- opened / edited --> GH
+    subgraph GH[GitHub Actions: daily 07:05 IST + on issue events]
         R[fare_monitor run]
     end
-    subgraph SRC[Authorised fare sources]
-        D[Duffel Flights API<br/>live airline offers]
-        S[SerpApi Google Flights API<br/>search + seller booking options]
-    end
-    R -- offer request + re-price --> D
-    R -- search + booking_token --> S
-    R <-- restore / save snapshot --> B[(fare-data branch<br/>SQLite + dashboard)]
-    R -- alerts, daily summary, health --> N{{Telegram / Email}}
-    R -- job summary, logs, ::error:: --> L[Actions logs + failure emails]
-    B -- optional --> P[GitHub Pages dashboard]
+    R -- search + booking_token --> S[SerpApi Google Flights API]
+    R -- optional --> D[Duffel API]
+    R <-- restore / save snapshot --> B[(fare-data branch: SQLite)]
+    R -- alert / status comments --> U
+    U -. GitHub email + mobile push .-> You((You))
+    R -- dashboard --> P[GitHub Pages]
 ```
 
 | Concern | Choice | Why |
 |---|---|---|
-| Language | Python 3.12, `requests` only | Small, auditable, easy to run anywhere |
-| Scheduler | GitHub Actions `cron: "17 * * * *"` | Free, managed, has secrets, logs and failure emails. Runs at :17 to avoid the top-of-hour backlog |
-| Storage | SQLite file kept on an orphan `fare-data` branch | No server to run. Every observation, search and alert is a row. The branch is force-pushed as one snapshot so the repo doesn't grow by a database copy per hour. Each run's database is also kept as a 14-day artifact |
-| Notifications | Telegram Bot API and/or SMTP email, chosen with `NOTIFY_CHANNELS` | Telegram is instant on a phone; email is a fallback |
-| Dashboard | Static `index.html` (no external libraries) on the `fare-data` branch; Markdown job summary on every run | Viewable from GitHub, Pages, or a downloaded file |
-| Monitoring | Run status per search, `::error::` annotations, failed job → GitHub email, operations alert after 3 fully failed runs, recovery notice | You hear about outages, not only about fares |
+| What to watch | GitHub issue form: route, dates or range, frequency or weekdays, book-now price, stops | A real form that works on a phone. No hosting, and no API key exposed in a public web page |
+| Scheduler | One GitHub Actions cron a day; each watch decides if today is a check day. Issue events trigger an immediate check | Free and managed. Research shows no reliable time-of-day pricing pattern, so one fixed time is enough |
+| Storage | SQLite on an orphan `fare-data` branch (one force-pushed snapshot), plus a 14-day artifact backup | No server to run; the full history lives in the database |
+| Notifications | Comments on the watch issue: GitHub emails the author and notifies the mobile app. Email (SMTP) and Telegram are optional | No extra accounts or secrets |
+| Budget | 1 search per route/date per check, shared across watches. Seller confirmation only when it could trigger an alert. SerpApi's own account API is read before each run, and checks pause with 20 searches left | Stays inside the 250-search free plan |
+| Dashboard | Static `index.html` published to GitHub Pages; status comment on each watch | Viewable anywhere |
 
 ## Fare sources
 
@@ -72,33 +69,35 @@ Every stored price also passes these checks:
 * the preference filters apply: max stops, max duration, departure window, minimum and maximum layover
 
 Duffel test-mode tokens are refused: their airlines are synthetic. Failed searches store no prices.
-Data older than 120 minutes is marked **stale** and is never shown as current.
+Prices older than 8 days are marked **stale** on the dashboard.
 
-## Hourly cycle (`fare_monitor/runner.py`)
+## Check cycle (`fare_monitor/runner.py`)
 
-1. Skip if `MONITOR_ENABLED=false`. If both dates have passed, send one final summary, then the workflow
-   disables itself.
-2. For each remaining date, independently, and each configured provider:
-   1. search
-   2. validate and filter
-   3. verify the cheapest options
-   4. validate again
-   5. store the top 20 plus the best-value option, each with its source and timestamp
-
-   A provider error is recorded and the run continues with the other providers.
-3. Decide alerts (`fare_monitor/analysis.py`) using only fares at or above `alert_min_status`:
-   * **Baseline**: the first eligible fare per date (one message, can be disabled).
-   * **Record low**: lower than every earlier eligible fare for that date, by at least ₹200 **and** 2%.
-     Smaller dips are still recorded in `record_lows`, but no alert is sent.
-   * **Attractive fare**: at or below `TARGET_FARE_INR` (if set), or at least 15% below the 7-day median
-     of hourly lows (needs 24 or more hourly lows first, so no guessing on thin data).
-   * **Previously unavailable flight now bookable**: a flight key (date + flight numbers) never seen
-     before, or unseen for 6 hours or more, that now sells within 5% of the date's current lowest fare.
-   * Every alert has a deduplication key (type + flight + price), so an unchanged price never alerts
-     twice. If no channel accepts a message it is not marked as sent, so a still-valid
-     target, attractive or new-flight alert fires again next hour.
-4. Send the daily summary once per day after 08:00 IST.
-5. Write `index.html`, `summary.md` and `summary.json`, and append the Markdown to the Actions job summary.
+1. **Load watches.**
+   * Read open issues titled `[Fare watch]` (or labelled `fare-watch`) from the owner or collaborators.
+   * An invalid watch gets one comment explaining the problem.
+   * A closed issue stops its watch.
+   * When the dates have passed, a final summary is posted and the issue is closed.
+2. **Decide what's due.** A watch is checked if it's new or edited, or if today is one of its check days
+   and it hasn't been checked today.
+3. **Check the budget.**
+   * Get usage from SerpApi's account API, which is free and doesn't count as a search, or from the
+     monitor's own counter.
+   * If there isn't enough left, the soonest travel dates are searched first. When nothing is left, every
+     watch gets one "paused" comment per month.
+4. **Search** each route/date once. Then validate the results: INR only, correct route and date,
+   plausible price, preference filters.
+5. **Confirm** (one extra search) the cheapest option only when:
+   * it's the first price for that date,
+   * its search price is below the search price behind the lowest confirmed fare, or
+   * it's at or below a watch's book-now price and wasn't confirmed in the last 72 hours.
+6. **Store** the top options, the best-value option and anything confirmed, each with its source and
+   timestamp.
+7. **Alert per watch**, using only confirmed prices: under book-now price, new record low (at least ₹200
+   and 2%), or a new or returning flight within 5% of the lowest. Each condition has a deduplication key,
+   so an unchanged price never alerts twice. All of a watch's alerts from one check go in one comment, so
+   one email.
+8. **Status:** edit the watch's status comment (no email), write the dashboard, and save the database.
 
 ## Database schema (SQLite)
 

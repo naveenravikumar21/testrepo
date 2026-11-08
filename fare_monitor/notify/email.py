@@ -1,6 +1,7 @@
-"""SMTP email notifier (works with Gmail app passwords, Amazon SES SMTP, SendGrid SMTP, etc.)."""
+"""SMTP email notifier (optional; e.g. Gmail with an app password)."""
 from __future__ import annotations
 
+import html
 import smtplib
 import ssl
 from email.message import EmailMessage
@@ -9,11 +10,11 @@ from email.message import EmailMessage
 class EmailNotifier:
     name = "email"
 
-    def __init__(self, config, session=None):
+    def __init__(self, config, session=None, github=None):
         self.s = config.secrets
 
     @classmethod
-    def is_configured(cls, config) -> bool:
+    def is_configured(cls, config, github=None) -> bool:
         s = config.secrets
         return bool(s.smtp_host and s.email_from and s.email_to)
 
@@ -22,13 +23,12 @@ class EmailNotifier:
         msg["Subject"] = message.subject
         msg["From"] = self.s.email_from
         msg["To"] = ", ".join(self.s.email_to)
-        msg.set_content(message.text)
-        msg.add_alternative(
-            "<html><body style=\"font-family:system-ui,sans-serif;font-size:14px;line-height:1.5\">"
-            + message.html.replace("\n", "<br>\n") + "</body></html>", subtype="html")
+        msg.set_content(message.body)
+        msg.add_alternative("<html><body><pre style=\"font-family:system-ui,sans-serif;white-space:pre-wrap\">"
+                            + html.escape(message.body) + "</pre></body></html>", subtype="html")
         return msg
 
-    def send(self, message):
+    def send(self, message, watch=None):
         msg = self.build(message)
         context = ssl.create_default_context()
         if self.s.smtp_use_ssl:
@@ -40,3 +40,4 @@ class EmailNotifier:
             if self.s.smtp_user:
                 server.login(self.s.smtp_user, self.s.smtp_password or "")
             server.send_message(msg)
+        return True

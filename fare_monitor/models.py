@@ -45,6 +45,8 @@ class Layover:
 class FareOption:
     provider: str                 # e.g. "duffel", "serpapi_google_flights"
     source: str                   # human readable source, e.g. "Google Flights (via SerpApi)"
+    origin: str                   # IATA code
+    destination: str              # IATA code
     travel_date: str              # ISO date of departure (local)
     airline: str                  # "IndiGo" or "IndiGo + Air India"
     flight_numbers: list[str]     # ["6E 123", "6E 456"]
@@ -69,7 +71,8 @@ class FareOption:
 
     @property
     def flight_key(self) -> str:
-        return f"{self.travel_date}|{'/'.join(fn.replace(' ', '') for fn in self.flight_numbers)}"
+        flights = "/".join(fn.replace(" ", "") for fn in self.flight_numbers)
+        return f"{self.origin}-{self.destination}|{self.travel_date}|{flights}"
 
     @property
     def flights_label(self) -> str:

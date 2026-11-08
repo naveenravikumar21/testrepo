@@ -1,0 +1,80 @@
+name: Fare watch
+description: Track flight prices for a route and dates, and get an email when it's worth booking.
+title: "[Fare watch] JAI → COK"
+labels: ["fare-watch"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Fill this in and press **Submit**. The first check runs within a few minutes, and you'll get a GitHub
+        email for every alert. **Close the issue to stop the watch; edit it to change anything.**
+
+        Searches: each date costs 1 search per check (free plan: 250 a month). Example: 2 dates checked
+        every day ≈ 60 searches a month.
+  - type: input
+    id: from
+    attributes:
+      label: From
+      description: Airport code or city (e.g. JAI, Jaipur, DEL).
+      value: JAI
+    validations:
+      required: true
+  - type: input
+    id: to
+    attributes:
+      label: To
+      description: Airport code or city (e.g. COK, Kochi, BOM).
+      value: COK
+    validations:
+      required: true
+  - type: textarea
+    id: dates
+    attributes:
+      label: Travel dates
+      description: |
+        One-way departure dates. Separate with commas, or give a range.
+        Examples: `2027-01-04, 2027-01-05` · `4 Jan 2027, 5 Jan 2027` · `2 Jan 2027 to 6 Jan 2027` (max 14 dates)
+      placeholder: 2027-01-04, 2027-01-05
+    validations:
+      required: true
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: How often to check
+      description: Checks run at about 7 AM IST.
+      options:
+        - Every day
+        - 3 times a week (Mon, Wed, Fri)
+        - 2 times a week (Mon, Thu)
+        - Once a week (Mon)
+      default: 0
+    validations:
+      required: true
+  - type: checkboxes
+    id: days
+    attributes:
+      label: Check on these days (optional)
+      description: Tick days to choose them yourself. This overrides the days in "How often to check".
+      options:
+        - label: Monday
+        - label: Tuesday
+        - label: Wednesday
+        - label: Thursday
+        - label: Friday
+        - label: Saturday
+        - label: Sunday
+  - type: input
+    id: target
+    attributes:
+      label: Book-now price (₹)
+      description: You get an alert when a confirmed fare is at or below this. Leave empty to only get record-low alerts.
+      placeholder: "7500"
+  - type: dropdown
+    id: stops
+    attributes:
+      label: Stops
+      options:
+        - Any (up to 2 stops)
+        - Up to 1 stop
+        - Non-stop only
+      default: 0

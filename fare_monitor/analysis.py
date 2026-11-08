@@ -78,7 +78,9 @@ def row_view(row) -> dict:
     d["layovers"] = [Layover(**l) for l in json.loads(d["layovers_json"])]
     d["booking_request"] = json.loads(d["booking_request_json"]) if d.get("booking_request_json") else None
     d["extra"] = json.loads(d["extra_json"]) if d.get("extra_json") else {}
-    d["flights_label"] = " / ".join(d["flight_numbers"])
+    # A through-flight that stops en route keeps one number on both legs ("QP 1361 / QP 1361"): show it once.
+    d["flights_label"] = " / ".join(fn for i, fn in enumerate(d["flight_numbers"])
+                                    if i == 0 or fn != d["flight_numbers"][i - 1])
     d["stops_label"] = "Non-stop" if d["stops"] == 0 else f"{d['stops']} stop{'s' if d['stops'] > 1 else ''}"
     d["layovers_label"] = ", ".join(
         f"{l.airport} {fmt_minutes(l.minutes)}{' (overnight)' if l.overnight else ''}" for l in d["layovers"]
